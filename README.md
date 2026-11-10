@@ -4,6 +4,8 @@ macOS / Windows 桌面 AI 陪伴应用。Tauri 2 + React + Rust + SQLite，云�
 
 当前版本 **0.1.2**，处于实际试用阶段。**已知问题：Windows 悬浮窗的部分按钮在实际使用中仍可能无法点击，尚未修复。** 详情见[已知问题](docs/known-issues.md)。
 
+[下载 Windows 安装包](https://github.com/JhonSmith0x7b/linger/releases/latest) · [构建与发布说明](docs/windows-build.md)
+
 ## 启动
 
 需要 Node.js 22.12+、当前 stable Rust 和对应平台的 Tauri 开发依赖。macOS 需要 Xcode Command Line Tools，Windows 需要 MSVC C++ Build Tools 与 WebView2。

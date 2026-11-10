@@ -1,8 +1,13 @@
-name: Desktop checks
+name: Desktop build and release
 on:
   push:
+    branches: [main]
+    tags: ["v*"]
   pull_request:
   workflow_dispatch:
+permissions:
+  contents: read
+
 jobs:
   build:
     strategy:
@@ -22,6 +27,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
+      - name: Verify release tag matches app version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          node -e 'const fs=require("fs"); const p=require("./package.json"); const t=require("./src-tauri/tauri.conf.json"); const c=fs.readFileSync("src-tauri/Cargo.toml","utf8").match(/^version = "([^"]+)"/m)[1]; if (process.env.RELEASE_TAG !== "v"+p.version || p.version !== t.version || p.version !== c) throw Error("Release tag and app versions must match");'
       - run: npm ci
       - run: npm run build
       - run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
@@ -40,3 +52,40 @@ jobs:
             src-tauri/target/release/linger.exe
           if-no-files-found: error
           retention-days: 14
+
+  release:
+    name: Publish Windows installer
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: Linger-windows-x64
+          path: artifacts
+      - name: Publish installer and checksum
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir release
+          find artifacts -type f -name '*-setup.exe' -exec cp {} release/ \;
+          cd release
+          test "$(find . -maxdepth 1 -name '*-setup.exe' | wc -l)" -eq 1
+          sha256sum ./*-setup.exe > SHA256SUMS.txt
+          cat > release-notes.md <<'NOTES'
+          Windows x64 测试版：下载下方 `*-setup.exe` 安装，覆盖升级前请从托盘退出旧版。
+
+          安装包未签名。已知问题：Windows 悬浮窗部分按钮可能无法点击，尚未解决。
+          不包含 API Key 或个人数据；首次使用请自行配置。
+          NOTES
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" ./*-setup.exe SHA256SUMS.txt --clobber
+          else
+            gh release create "$RELEASE_TAG" ./*-setup.exe SHA256SUMS.txt --verify-tag --title "Linger $RELEASE_TAG" --notes-file release-notes.md
+          fi

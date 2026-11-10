@@ -37,3 +37,13 @@ PATH="/opt/homebrew/opt/llvm/bin:/opt/homebrew/opt/lld/bin:$PATH" npm run tauri 
 ## CI 产物
 
 `.github/workflows/desktop.yml` 的 Windows job 在检查通过后构建 NSIS 包并上传 `Linger-windows-x64` artifact。推送、拉取请求或手动运行会触发检查；构建产物可在对应 GitHub Actions 运行中下载。
+
+## 直接下载安装包
+
+在 [GitHub Releases](https://github.com/JhonSmith0x7b/linger/releases/latest) 下载 `Linger_*_x64-setup.exe`，无需远程访问开发电脑。`SHA256SUMS.txt` 可校验下载文件。
+
+- 推送到 `main`、PR 或手动运行：执行检查并上传 Windows artifact。
+- 推送 `v*` 版本标签（例如 `v0.1.2`）：验证标签与应用版本一致，macOS/Windows 检查均通过后，自动创建 Release 并上传 Windows 安装包和校验文件。
+- 发布无需个人 Token 或签名证书，使用工作流内置的仓库 Token；只有发布 job 获得写入权限。
+
+发布时先同步 package.json、package-lock.json、Cargo.toml、Cargo.lock 和 tauri.conf.json 中的应用版本，再提交、打标签并推送。当前包未做 Windows 代码签名。
