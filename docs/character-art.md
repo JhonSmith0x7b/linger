@@ -1,0 +1,15 @@
+# 角色卡插画
+
+使用内置 image_gen 工具生成；没有调用项目内的 API Key。原始 PNG 复制到 `public/characters/`，随应用打包。插画是角色选择与头像素材，不是 Live2D／3D 虚拟形象。角色行为由可编辑的人格文本决定。
+
+## 栞 — shiori.png
+
+Use case: stylized-concept. Asset type: anime character portrait illustration for a quiet desktop AI companion's selectable persona card. Create ONE original adult woman in her mid twenties named Shiori (no text in image). Medium-length chestnut hair, soft sage green eyes, simple cream cardigan with sage detail, holding a closed book loosely. Calm attentive expression with a tiny knowing smile: outwardly quiet and gentle, subtly independent-minded and observant. Contemporary refined Japanese anime illustration, delicate clean line art, painterly soft shading, warm natural light. Bust portrait, face near upper center, plenty of space around hair, square composition easy to crop to a tall card or round avatar. Muted sage and cream reading-room background, unobtrusive. Fully clothed, no school uniform, no sexualization. No lettering, no logo, no border, no watermark. One character only.
+
+## 小晴 — koharu.png
+
+Use case: stylized-concept. Asset type: anime portrait for a selectable desktop companion persona card. Create ONE original adult woman in her mid twenties, Koharu (no text). Short apricot-copper hair with a small simple hair clip, amber eyes, relaxed peach sweater over a white top. Bright slightly mischievous smile and lively attentive gaze; expressive but not exaggerated. Outwardly sunny and playful, inwardly considerate and perceptive. Soft afternoon light with muted peach-and-cream studio backdrop, a leafy plant and blurred hobby shelf. Contemporary refined Japanese anime illustration, delicate clean line art, painterly soft shading, polished consistent visual novel art direction. Bust portrait, face near upper center, square composition easy to crop to tall card and round avatar. Plenty of breathing room around the hair. Fully clothed, no school uniform, no sexualization, no extra people, no text, no logo, no watermark, no frame.
+
+## 凛 — rin.png
+
+Use case: stylized-concept. Asset type: anime portrait for a selectable desktop companion persona card. Create ONE original adult woman in her mid twenties, Rin (no text). Straight dark midnight-blue hair to her shoulders, cool gray-blue eyes, navy cardigan over a modest pale gray turtleneck. Reserved thoughtful gaze with a barely visible affectionate half-smile, holding a warm ceramic mug. Outwardly composed and analytical, inwardly quietly caring. Blue-hour desk-side backdrop, soft muted navy/lavender and warm amber lamplight, quiet and welcoming rather than cold. Contemporary refined Japanese anime illustration, delicate clean line art, painterly soft shading, polished consistent visual novel art direction. Bust portrait, face near upper center, square composition easy to crop to tall card and round avatar. Plenty of breathing room around the hair. Fully clothed, no school uniform, no sexualization, no extra people, no text, no logo, no watermark, no frame.
