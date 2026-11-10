@@ -21,7 +21,7 @@ impl Layout {
     fn size(self) -> (f64, f64) {
         match self {
             Self::Orb => (96.0, 56.0),
-            Self::Tools => (240.0, 72.0),
+            Self::Tools => (280.0, 72.0),
             Self::Bubble => (320.0, 132.0),
             Self::Chat | Self::Translate | Self::More => (320.0, 440.0),
         }
@@ -116,7 +116,7 @@ fn hit(layout: Layout, width: f64, height: f64, x: f64, y: f64, speaking: bool) 
     }
     match layout {
         Layout::Orb => false,
-        Layout::Tools => (0..if speaking { 3 } else { 2 })
+        Layout::Tools => (0..if speaking { 4 } else { 3 })
             .any(|i| circle(x, y, width - 118.0 - 42.0 * i as f64, height - 28.0, 18.0)),
         _ => rounded_rect(x, y, 4.0, 4.0, width - 4.0, height - 64.0, 16.0),
     }
@@ -335,12 +335,13 @@ mod tests {
     fn transparent_pixels_pass_through_but_orb_controls_and_cards_work() {
         assert!(hit(Layout::Orb, 56.0, 56.0, 28.0, 28.0, false));
         assert!(!hit(Layout::Orb, 56.0, 56.0, 1.0, 1.0, false));
-        assert!(hit(Layout::Tools, 240.0, 72.0, 80.0, 44.0, false));
-        assert!(!hit(Layout::Tools, 240.0, 72.0, 185.0, 44.0, false));
-        assert!(!hit(Layout::Tools, 240.0, 72.0, 101.0, 44.0, false));
-        assert!(hit(Layout::Tools, 240.0, 72.0, 164.0, 44.0, false));
-        assert!(hit(Layout::Tools, 240.0, 72.0, 38.0, 44.0, true));
-        assert!(!hit(Layout::Tools, 240.0, 72.0, 38.0, 44.0, false));
+        assert!(hit(Layout::Tools, 280.0, 72.0, 120.0, 44.0, false));
+        assert!(!hit(Layout::Tools, 280.0, 72.0, 225.0, 44.0, false));
+        assert!(!hit(Layout::Tools, 280.0, 72.0, 141.0, 44.0, false));
+        assert!(hit(Layout::Tools, 280.0, 72.0, 204.0, 44.0, false));
+        assert!(hit(Layout::Tools, 280.0, 72.0, 78.0, 44.0, false));
+        assert!(hit(Layout::Tools, 280.0, 72.0, 36.0, 44.0, true));
+        assert!(!hit(Layout::Tools, 280.0, 72.0, 36.0, 44.0, false));
         assert!(hit(Layout::Orb, 96.0, 56.0, 20.0, 28.0, false));
         assert!(!hit(Layout::Orb, 96.0, 56.0, 40.0, 28.0, false));
         assert!(hit(Layout::Chat, 320.0, 440.0, 150.0, 200.0, false));

@@ -11,6 +11,7 @@ export interface Settings {
   tts_model: string;
   translation_model: string;
   translation_language: string;
+  translation_auto_copy: boolean;
   response_format: string;
   volume: number;
   audio_input_device: string;

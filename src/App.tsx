@@ -26,6 +26,7 @@ const defaults: Settings = {
   tts_model: "gpt-4o-mini-tts",
   translation_model: "gpt-4.1-mini",
   translation_language: "英语",
+  translation_auto_copy: false,
   response_format: "pcm",
   volume: 0.8,
   audio_input_device: "",
@@ -191,6 +192,8 @@ export default function App() {
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [saving, setSaving] = useState(false);
+  const [autoCopySaving, setAutoCopySaving] = useState(false);
+  const autoCopySavingRef = useRef(false);
   const [ready, setReady] = useState(false);
   const [memoryInput, setMemoryInput] = useState("");
   const [memoryScope, setMemoryScope] = useState("long_term");
@@ -394,6 +397,7 @@ export default function App() {
             setDraft((previous) => ({
               ...previous,
               observing: payload.observing,
+              translation_auto_copy: payload.translation_auto_copy,
               capture_source: previous.capture_source === priorSource ? payload.capture_source : previous.capture_source,
               volume,
             }));
@@ -531,6 +535,15 @@ export default function App() {
       setSaving(false);
     }
   }
+  async function setTranslationAutoCopy(enabled: boolean) {
+    if (autoCopySavingRef.current) return;
+    autoCopySavingRef.current = true; setAutoCopySaving(true);
+    try {
+      await invoke("set_translation_auto_copy", { enabled });
+      setSettings(previous => ({ ...previous, translation_auto_copy: enabled }));
+      setDraft(previous => ({ ...previous, translation_auto_copy: enabled }));
+    } finally { autoCopySavingRef.current = false; setAutoCopySaving(false); }
+  }
   async function changeVolume(volume: number) {
     volumeRef.current = volume;
     pendingVolume.current = volume;
@@ -657,7 +670,7 @@ export default function App() {
   </>;
 
   if (compact)
-    return <FloatingPanel settings={settings} messages={messages} streamText={streamText} ready={ready} status={status} error={error} onStartRecording={startRecording} onStopRecording={stopRecording} onToggleObserving={() => void toggleObserving()} observationBusy={observationBusy || sourceBusy} sourceControls={sourceControls} />;
+    return <FloatingPanel settings={settings} messages={messages} streamText={streamText} ready={ready} status={status} error={error} onStartRecording={startRecording} onStopRecording={stopRecording} onToggleObserving={() => void toggleObserving()} observationBusy={observationBusy || sourceBusy} sourceControls={sourceControls} onSetTranslationAutoCopy={setTranslationAutoCopy} />;
 
   return (
     <div className="app-shell">
@@ -1207,6 +1220,12 @@ export default function App() {
                     <input list="translation-languages" value={draft.translation_language} onChange={(e) => change("translation_language", e.target.value)} placeholder="例如：英语、日语、韩语" maxLength={80} />
                     <datalist id="translation-languages">{["英语", "日语", "韩语", "法语", "德语", "西班牙语"].map(language => <option key={language} value={language} />)}</datalist>
                   </Field>
+                  <label className="checkbox-label">
+                    <input type="checkbox" checked={settings.translation_auto_copy || false} disabled={!ready || autoCopySaving || saving}
+                      onChange={(e) => { void setTranslationAutoCopy(e.target.checked).catch(report); }} />
+                    翻译完成后自动复制到剪贴板
+                  </label>
+                  <p className="translation-help">立即保存生效，会替换剪贴板原有内容；仍可手动复制译文。</p>
                   <Field label="搜索模型">
                     <input
                       type="search"
@@ -1516,7 +1535,7 @@ export default function App() {
                   </div>
                   <ShortcutRecorder
                     value={draft.shortcut}
-                    disabled={!ready || saving || capturingShortcut}
+                    disabled={!ready || saving || autoCopySaving || capturingShortcut}
                     onChange={(shortcut) => change("shortcut", shortcut)}
                     onBusy={setCapturingShortcut}
                     onError={report}
@@ -1656,7 +1675,7 @@ export default function App() {
                 <span role="status">{notice || "设置保存在本机"}</span>
                 <button
                   className="primary-button"
-                  disabled={!ready || saving || capturingShortcut}
+                  disabled={!ready || saving || autoCopySaving || capturingShortcut}
                 >
                   {saving ? "正在保存…" : "保存设置"}
                 </button>

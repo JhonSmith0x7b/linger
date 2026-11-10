@@ -486,6 +486,25 @@ fn test_voice(
 }
 
 #[tauri::command]
+fn set_translation_auto_copy(
+    app: tauri::AppHandle,
+    core: State<Arc<Core>>,
+    enabled: bool,
+) -> Result<(), String> {
+    let updated = {
+        let mut settings = core.settings.lock().unwrap();
+        let mut updated = settings.clone();
+        updated.translation_auto_copy = enabled;
+        core.store
+            .save_settings(&serde_json::to_value(&updated).map_err(|e| e.to_string())?)?;
+        *settings = updated.clone();
+        updated
+    };
+    let _ = app.emit("linger:settings", updated);
+    Ok(())
+}
+
+#[tauri::command]
 fn set_volume(app: tauri::AppHandle, core: State<Arc<Core>>, volume: f32) -> Result<(), String> {
     if !volume.is_finite() || !(0.0..=1.0).contains(&volume) {
         return Err("音量范围为 0–1".into());
@@ -754,6 +773,7 @@ fn main() {
             set_observing,
             test_voice,
             set_volume,
+            set_translation_auto_copy,
             toggle_compact,
             overlay::compact_set_layout,
             overlay::compact_set_hit_regions,

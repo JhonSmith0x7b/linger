@@ -39,6 +39,7 @@ pub struct Settings {
     pub conversation_model: String,
     pub translation_model: String,
     pub translation_language: String,
+    pub translation_auto_copy: bool,
     pub asr_model: String,
     pub memory_model: String,
     pub tts_model: String,
@@ -64,6 +65,7 @@ impl Default for Settings {
             conversation_model: "gpt-4.1-mini".into(),
             translation_model: "gpt-4.1-mini".into(),
             translation_language: "英语".into(),
+            translation_auto_copy: false,
             asr_model: "gpt-transcribe".into(),
             memory_model: "gpt-4.1-mini".into(),
             tts_model: "gpt-4o-mini-tts".into(),
@@ -255,9 +257,14 @@ mod tests {
         let mut old = serde_json::to_value(Settings::default()).unwrap();
         old.as_object_mut().unwrap().remove("translation_model");
         old.as_object_mut().unwrap().remove("translation_language");
+        old.as_object_mut().unwrap().remove("translation_auto_copy");
         let mut settings = Settings::from_stored(old).unwrap();
         assert_eq!(settings.translation_model, "gpt-4.1-mini");
         assert_eq!(settings.translation_language, "英语");
+        assert!(!settings.translation_auto_copy);
+        settings.translation_auto_copy = true;
+        let restored = Settings::from_stored(serde_json::to_value(&settings).unwrap()).unwrap();
+        assert!(restored.translation_auto_copy);
         settings.translation_language = " ".into();
         assert!(settings.validate().is_err());
     }

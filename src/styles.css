@@ -1524,3 +1524,7 @@ html.orb-document, .orb-document body, .orb-document #root { margin: 0; min-widt
 
 .observation-feedback { display: block; margin-top: 7px; color: #78876c; font-size: 11px; line-height: 1.6; overflow-wrap: anywhere; }
 .observation-feedback[data-phase="error"] { color: #b15345; }
+
+.orb-tools .orb-voice { display: grid; place-items: center; }
+.orb-tools .orb-voice.active { background: #f7d8d0; color: #9c453b; border-color: #d58b80; }
+.floating-translation .translation-auto-copy { display: flex; align-items: center; gap: 6px; font-size: 11px; margin-bottom: 12px; }
