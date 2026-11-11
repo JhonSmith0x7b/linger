@@ -9,6 +9,7 @@ import type {
   Memory,
   Message,
   ObservationStatus,
+  MicrophoneStatus,
   Settings,
   Status,
   CharacterTts,
@@ -51,6 +52,7 @@ const defaults: Settings = {
 const phases: Record<string, string> = {
   idle: "在这里陪你",
   recording: "正在听你说",
+  preparing_recording: "麦克风准备中",
   transcribing: "正在转写",
   thinking: "想一想",
   generating: "正在回应",
@@ -188,6 +190,7 @@ export default function App() {
   const observationInFlight = useRef(false);
   const savedSource = useRef("monitor:primary");
   const [status, setStatus] = useState<Status>({ phase: "idle", detail: "" });
+  const [microphone, setMicrophone] = useState<MicrophoneStatus>({ phase: "preparing", detail: "麦克风准备中" });
   const [observationStatus, setObservationStatus] = useState<ObservationStatus | null>(null);
   const [input, setInput] = useState("");
   const [apiKey, setApiKey] = useState("");
@@ -222,7 +225,9 @@ export default function App() {
     ? draft.capture_source.split(":")
     : null;
   const holding = useRef(false);
-  const recordingStart = useRef<Promise<unknown> | null>(null);
+  const recordingQueue = useRef<Promise<unknown>>(Promise.resolve());
+  const recordingGeneration = useRef(0);
+  const recordingReset = useRef(0);
   const bottom = useRef<HTMLDivElement>(null);
   const desktop = isTauri();
   const report = useCallback(
@@ -244,6 +249,25 @@ export default function App() {
     },
     [report],
   );
+  useEffect(() => {
+    if (!desktop) return;
+    let disposed = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    async function pollMicrophone() {
+      try {
+        const next = await invoke<MicrophoneStatus>("get_microphone_status");
+        if (!disposed && next) setMicrophone((previous) =>
+          previous.phase === next.phase && previous.detail === next.detail ? previous : next);
+      } catch {
+        if (!disposed) setMicrophone({ phase: "error", detail: "无法读取麦克风状态，请检查音频设置" });
+      } finally {
+        // Schedule after completion so slow native calls cannot overlap.
+        if (!disposed) timer = setTimeout(() => void pollMicrophone(), 1000);
+      }
+    }
+    void pollMicrophone();
+    return () => { disposed = true; clearTimeout(timer); };
+  }, [desktop]);
   const refreshMemories = useCallback(async () => {
     try {
       setMemories(await invoke<Memory[]>("list_memories"));
@@ -487,6 +511,7 @@ export default function App() {
     setMessages([]); setStreamText(""); setInput(""); setError("");
     setHistoryLoading(false); setHasOlderMessages(false); setBrowsingHistory(false);
     setConfirmClear(false); setObservationStatus(null);
+    recordingReset.current += 1; recordingGeneration.current += 1;
     holding.current = false; setHeld(false);
     setConversationEpoch(epoch => epoch + 1);
   }
@@ -543,9 +568,7 @@ export default function App() {
       if (!holding.current) return;
       holding.current = false;
       setHeld(false);
-      void recordingStart.current
-        ?.then(() => invoke("stop_recording"))
-        .catch(report);
+      enqueueRecordingStop();
     };
     window.addEventListener("blur", stop);
     return () => window.removeEventListener("blur", stop);
@@ -678,14 +701,28 @@ export default function App() {
       setInput((old) => old || text);
     }
   }
+  function enqueueRecordingStop() {
+    const generation = recordingGeneration.current;
+    recordingQueue.current = recordingQueue.current.then(() => invoke("stop_recording")).catch((e) => {
+      if (generation === recordingGeneration.current) report(e);
+    });
+  }
   function startRecording() {
     if (holding.current || !ready) return;
     resumeLatestHistory();
     holding.current = true;
     setHeld(true);
     setError("");
-    recordingStart.current = invoke("start_recording");
-    void recordingStart.current.catch((e) => {
+    const generation = ++recordingGeneration.current;
+    const reset = recordingReset.current;
+    // Serialize complete gestures: Start 1 -> Stop 1 -> Start 2, even while
+    // the native device is still preparing Start 1.
+    recordingQueue.current = recordingQueue.current.then(async () => {
+      if (reset !== recordingReset.current) return;
+      if (generation === recordingGeneration.current) setError("");
+      await invoke("start_recording");
+    }).catch((e) => {
+      if (generation !== recordingGeneration.current) return;
       holding.current = false;
       setHeld(false);
       report(e);
@@ -695,9 +732,11 @@ export default function App() {
     if (!holding.current) return;
     holding.current = false;
     setHeld(false);
-    void recordingStart.current
-      ?.then(() => invoke("stop_recording"))
-      .catch(report);
+    enqueueRecordingStop();
+  }
+  function stopRecordingFromOrb() {
+    if (holding.current) stopRecording();
+    else if (["recording", "preparing_recording"].includes(status.phase)) enqueueRecordingStop();
   }
   async function toggleObserving() {
     if (observationInFlight.current || sourceInFlight.current) return;
@@ -752,7 +791,7 @@ export default function App() {
   </>;
 
   if (compact)
-    return <FloatingPanel key={conversationEpoch} settings={settings} messages={messages} streamText={streamText} ready={ready} status={status} error={error} onStartRecording={startRecording} onStopRecording={stopRecording} onToggleObserving={() => void toggleObserving()} observationBusy={observationBusy || sourceBusy} sourceControls={sourceControls} onSetTranslationAutoCopy={setTranslationAutoCopy} />;
+    return <FloatingPanel key={conversationEpoch} settings={settings} messages={messages} streamText={streamText} ready={ready} status={status} microphone={microphone} recordingRequested={held} error={error} onStartRecording={startRecording} onStopRecording={stopRecordingFromOrb} onToggleObserving={() => void toggleObserving()} observationBusy={observationBusy || sourceBusy} sourceControls={sourceControls} onSetTranslationAutoCopy={setTranslationAutoCopy} />;
 
   return (
     <div className="app-shell">
@@ -1046,7 +1085,8 @@ export default function App() {
                   <span>全局按住说话</span>
                 </div>
                 <button
-                  className={`ptt-button ${held || status.phase === "recording" ? "recording" : ""}`}
+                  className={`ptt-button ${status.phase === "recording" && microphone.phase !== "error" ? "recording" : (held || status.phase === "preparing_recording") && microphone.phase !== "error" ? "preparing" : ""}`}
+                  title={microphone.detail}
                   disabled={!ready}
                   onPointerDown={(e) => {
                     if (e.button !== 0) return;
@@ -1073,9 +1113,11 @@ export default function App() {
                   onBlur={stopRecording}
                 >
                   <Icon name="mic" size={18} />
-                  {held || status.phase === "recording"
-                    ? "松开，发送语音"
-                    : "按住说话"}
+                  {status.phase === "recording"
+                    ? microphone.phase === "error" ? "麦克风中断 · 松开结束" : "松开，发送语音"
+                    : held || status.phase === "preparing_recording"
+                      ? "麦克风准备中…"
+                      : microphone.phase === "error" ? "麦克风异常 · 按住重试" : "按住说话"}
                 </button>
                 <button
                   className="icon-button stop-button"
@@ -1483,8 +1525,10 @@ export default function App() {
                 <>
                   <div className="section-intro">
                     <h2>麦克风与扬声器</h2>
-                    <p>保存后，从下一次录音或播放开始使用。角色的音色与说话方式仍在角色卡中设置。</p>
+                    <p>保存后会准备选定的麦克风，输出设备从下次播放开始使用。角色的音色与说话方式仍在角色卡中设置。</p>
                   </div>
+                  <p className={`microphone-status ${microphone.phase}`} role="status">{microphone.detail}</p>
+                  <p className="field-help">麦克风保持待命，按键或点击录音才收集本段声音；待命音频直接丢弃，不保存、不上传。</p>
                   {([
                     ["audio_input_device", "录音输入 · 麦克风", audioDevices.inputs],
                     ["audio_output_device", "播放输出 · 扬声器 / 耳机", audioDevices.outputs],

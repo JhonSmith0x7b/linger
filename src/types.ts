@@ -80,3 +80,8 @@ export interface AudioDevices {
   inputs: { id: string; name: string }[];
   outputs: { id: string; name: string }[];
 }
+
+export type MicrophoneStatus = {
+  phase: "preparing" | "ready" | "recording" | "error";
+  detail: string;
+};

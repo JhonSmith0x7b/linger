@@ -536,7 +536,13 @@ fn save_settings(
         return Err("请先完成或取消快捷键录入，再保存设置".into());
     }
     settings.validate()?;
+    let _turn_gate = core.turn_gate.lock().unwrap();
     let old = core.settings();
+    if core.recording.load(Ordering::SeqCst)
+        && settings.audio_input_device != old.audio_input_device
+    {
+        return Err("请先结束录音，再切换输入设备".into());
+    }
     settings.compact_visible = old.compact_visible;
     let old_registered = app.global_shortcut().is_registered(old.shortcut.as_str());
     let new_shortcut = settings
@@ -570,7 +576,7 @@ fn save_settings(
         }
         return Err(e);
     }
-    core.interrupt();
+    core.interrupt_locked();
     core.devices.set_volume(settings.volume);
     core.devices.set_audio_devices(
         settings.audio_input_device.clone(),
@@ -684,7 +690,18 @@ fn send_text(app: tauri::AppHandle, core: State<Arc<Core>>, text: String) -> Res
     Ok(())
 }
 #[tauri::command]
-fn start_recording(app: tauri::AppHandle, core: State<Arc<Core>>) -> Result<(), String> {
+fn get_microphone_status(core: State<Arc<Core>>) -> devices::MicrophoneStatus {
+    core.devices.microphone_status()
+}
+#[tauri::command]
+async fn start_recording(app: tauri::AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        start_recording_inner(app.clone(), app.state::<Arc<Core>>())
+    })
+    .await
+    .map_err(|e| format!("录音任务失败：{e}"))?
+}
+fn start_recording_inner(app: tauri::AppHandle, core: State<Arc<Core>>) -> Result<(), String> {
     let capture = core.shortcut_capture.lock().unwrap();
     if capture.active().is_some() {
         status(&app, "error", "正在录入快捷键，暂不开始语音录音");
@@ -696,6 +713,7 @@ fn start_recording(app: tauri::AppHandle, core: State<Arc<Core>>) -> Result<(), 
     }
     drop(capture);
     core.interrupt_locked();
+    status(&app, "preparing_recording", "麦克风准备中，请稍候再说话");
     if let Err(e) = core.devices.start_recording() {
         core.recording.store(false, Ordering::SeqCst);
         status(&app, "error", &e);
@@ -708,23 +726,34 @@ fn start_recording(app: tauri::AppHandle, core: State<Arc<Core>>) -> Result<(), 
     let generation = c.recording_epoch.fetch_add(1, Ordering::SeqCst) + 1;
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(120)).await;
-        if c.recording_epoch.load(Ordering::SeqCst) == generation
-            && c.recording.swap(false, Ordering::SeqCst)
-        {
-            let _ = c.devices.stop_recording();
-            status(&a, "idle", "录音达到两分钟，已停止；请重新按键说话");
-        }
+        let _ = tauri::async_runtime::spawn_blocking(move || {
+            let _gate = c.turn_gate.lock().unwrap();
+            if c.recording_epoch.load(Ordering::SeqCst) == generation
+                && c.recording.swap(false, Ordering::SeqCst)
+            {
+                let _ = c.devices.stop_recording();
+                status(&a, "idle", "录音达到两分钟，已停止；请重新按键说话");
+            }
+        })
+        .await;
     });
     Ok(())
 }
 #[tauri::command]
-fn stop_recording(app: tauri::AppHandle, core: State<Arc<Core>>) -> Result<(), String> {
+async fn stop_recording(app: tauri::AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        stop_recording_inner(app.clone(), app.state::<Arc<Core>>())
+    })
+    .await
+    .map_err(|e| format!("录音任务失败：{e}"))?
+}
+fn stop_recording_inner(app: tauri::AppHandle, core: State<Arc<Core>>) -> Result<(), String> {
     let gate = core.turn_gate.lock().unwrap();
     if !core.recording.swap(false, Ordering::SeqCst) {
         return Ok(());
     }
     let recording_epoch = core.recording_epoch.fetch_add(1, Ordering::SeqCst) + 1;
-    let recording = core.devices.stop_recording().inspect_err(|e| {
+    let recording = core.devices.stop_recording_with_tail().inspect_err(|e| {
         status(&app, "error", e);
     })?;
     let trigger = match recording {
@@ -1017,22 +1046,39 @@ fn end_shortcut_capture(
 }
 
 fn register_shortcut(app: &tauri::AppHandle, shortcut: &str) -> Result<(), String> {
-    app.global_shortcut()
-        .on_shortcut(shortcut, |app, _, event| {
-            let state = app.state::<Arc<Core>>();
-            if state.shortcut_capture.lock().unwrap().active().is_some() {
-                return;
-            }
-            let result = match event.state {
-                ShortcutState::Pressed => start_recording(app.clone(), state),
-                ShortcutState::Released => stop_recording(app.clone(), state),
+    // Preserve press/release order while device recovery runs off the UI thread.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let handle = app.clone();
+    std::thread::spawn(move || {
+        while let Ok(pressed) = rx.recv() {
+            let state = handle.state::<Arc<Core>>();
+            let result = if pressed {
+                start_recording_inner(handle.clone(), state)
+            } else {
+                stop_recording_inner(handle.clone(), state)
             };
             if let Err(e) = result {
-                status(app, "error", &e);
+                status(&handle, "error", &e);
             }
+        }
+    });
+    app.global_shortcut()
+        .on_shortcut(shortcut, move |app, _, event| {
+            if app
+                .state::<Arc<Core>>()
+                .shortcut_capture
+                .lock()
+                .unwrap()
+                .active()
+                .is_some()
+            {
+                return;
+            }
+            let _ = tx.send(event.state == ShortcutState::Pressed);
         })
         .map_err(|e| format!("快捷键注册失败：{e}"))
 }
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
@@ -1101,6 +1147,24 @@ fn main() {
             core.devices.set_volume(core.settings().volume);
             core.devices.set_audio_devices(core.settings().audio_input_device, core.settings().audio_output_device);
             app.manage(core.clone());
+            // A broken capture is discarded by the device worker. End the logical
+            // turn too, so a recovered device never looks like resumed recording.
+            let microphone_core = core.clone();
+            let microphone_app = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    if let Ok(_gate) = microphone_core.turn_gate.try_lock() {
+                        let microphone = microphone_core.devices.microphone_status();
+                        if microphone.phase == "error"
+                            && microphone_core.recording.swap(false, Ordering::SeqCst)
+                        {
+                            microphone_core.recording_epoch.fetch_add(1, Ordering::SeqCst);
+                            status(&microphone_app, "error", &microphone.detail);
+                        }
+                    }
+                }
+            });
             app.manage(overlay::Overlay::default());
             overlay::start_hit_testing(app.handle().clone());
             if let Err(e) = register_shortcut(app.handle(), &shortcut) {
@@ -1222,6 +1286,7 @@ fn main() {
             delete_memory,
             list_sources,
             list_audio_devices,
+            get_microphone_status,
             get_screen_permission,
             request_screen_permission,
             set_capture_source,

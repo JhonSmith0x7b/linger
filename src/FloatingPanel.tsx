@@ -5,15 +5,15 @@ import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { MarkdownText } from "./MarkdownText";
-import type { Message, Settings, Status } from "./types";
+import type { Message, Settings, Status, MicrophoneStatus } from "./types";
 
 type Placement = { width: number; height: number; orb_x: number; orb_y: number; panel_x: number; panel_y: number; panel_width: number; panel_height: number; controls_left: boolean };
 
 type Mode = "orb" | "tools" | "chat" | "translate" | "more" | "bubble";
-const phaseNames: Record<string, string> = { idle: "在这里陪你", recording: "正在听 · 再点麦克风发送", transcribing: "正在识别语音", thinking: "正在想一想", generating: "正在回应", observing: "看看你的屏幕", playing: "正在说话", speaking: "正在说话", synthesizing: "准备说给你听", stopped: "已停止", error: "有件事需要留意", tool: "正在使用工具" };
+const phaseNames: Record<string, string> = { idle: "在这里陪你", preparing_recording: "麦克风准备中…", recording: "正在听 · 再点麦克风发送", transcribing: "正在识别语音", thinking: "正在想一想", generating: "正在回应", observing: "看看你的屏幕", playing: "正在说话", speaking: "正在说话", synthesizing: "准备说给你听", stopped: "已停止", error: "有件事需要留意", tool: "正在使用工具" };
 
-export function FloatingPanel({ settings, messages, streamText, ready, status, error: companionError, onStartRecording, onStopRecording, onToggleObserving, sourceControls, observationBusy, onSetTranslationAutoCopy }: {
-  settings: Settings; messages: Message[]; streamText: string; ready: boolean; status: Status; error: string;
+export function FloatingPanel({ settings, messages, streamText, ready, status, microphone, recordingRequested, error: companionError, onStartRecording, onStopRecording, onToggleObserving, sourceControls, observationBusy, onSetTranslationAutoCopy }: {
+  settings: Settings; messages: Message[]; streamText: string; ready: boolean; status: Status; microphone: MicrophoneStatus; recordingRequested: boolean; error: string;
   onSetTranslationAutoCopy: (enabled: boolean) => Promise<void>; onStartRecording: () => void; onStopRecording: () => void; onToggleObserving: () => void; sourceControls: ReactNode; observationBusy: boolean;
 }) {
   const [mode, setMode] = useState<Mode>("orb");
@@ -55,8 +55,12 @@ export function FloatingPanel({ settings, messages, streamText, ready, status, e
   const stopRef = useRef(onStopRecording); stopRef.current = onStopRecording;
   const length = Array.from(text).length;
   const speaking = ["speaking", "playing", "synthesizing"].includes(status.phase);
-  const phase = ["thinking", "generating", "tool"].includes(status.phase) ? "thinking" : speaking ? "speaking" : status.phase;
-  const label = phaseNames[status.phase] || status.detail;
+  const captureFailed = status.phase === "recording" && microphone.phase === "error";
+  const phase = captureFailed ? "error" : ["thinking", "generating", "tool"].includes(status.phase) ? "thinking" : speaking ? "speaking" : status.phase;
+  const voicePending = (voiceRecording || status.phase === "preparing_recording") && status.phase !== "recording";
+  const voiceEngaged = voiceRecording || ["recording", "preparing_recording"].includes(status.phase);
+  const voiceButtonLabel = captureFailed ? "麦克风中断 · 点击结束" : voicePending ? "麦克风准备中 · 再点取消" : voiceEngaged ? "停止录音并发送" : "开始录音";
+  const label = captureFailed ? microphone.detail : voicePending ? "麦克风准备中…" : phaseNames[status.phase] || status.detail;
 
   const changeMode = useCallback((next: Mode) => {
     clearTimeout(hideTimer.current);
@@ -155,13 +159,13 @@ export function FloatingPanel({ settings, messages, streamText, ready, status, e
   }, [status.phase]);
   useEffect(() => {
     if (status.phase !== "recording") setLevel(0);
-    if (["error", "idle", "stopped", "transcribing", "thinking"].includes(status.phase)) {
+    if (!recordingRequested && ["error", "idle", "stopped", "transcribing", "thinking"].includes(status.phase)) {
       voiceActive.current = false; setVoiceRecording(false);
     }
-  }, [status.phase]);
+  }, [status.phase, recordingRequested]);
   useEffect(() => {
-    if (companionError) showBubble(companionError);
-  }, [companionError, showBubble]);
+    if (companionError && !recordingRequested) showBubble(companionError);
+  }, [companionError, recordingRequested, showBubble]);
   useEffect(() => {
     if (!ready) return;
     const last = messages.at(-1);
@@ -289,8 +293,8 @@ export function FloatingPanel({ settings, messages, streamText, ready, status, e
   }
   function toggleVoice() {
     clearTimeout(hideTimer.current);
-    if (voiceActive.current || status.phase === "recording") {
-      if (voiceActive.current) stopRef.current(); else void command("stop_recording");
+    if (voiceActive.current || ["recording", "preparing_recording"].includes(status.phase)) {
+      stopRef.current();
       voiceActive.current = false; setVoiceRecording(false);
     } else {
       voiceActive.current = true; setVoiceRecording(true);
@@ -312,8 +316,8 @@ export function FloatingPanel({ settings, messages, streamText, ready, status, e
 
       <button title="打开主界面" aria-label="打开主界面" onClick={() => { changeMode("orb"); void command("compact_open_main", { settings: false }); }}><span aria-hidden="true">☰</span></button>
       <button title="更多操作" aria-label="更多操作" onClick={() => changeMode("more")}>···</button>
-      <button className={voiceRecording || status.phase === "recording" ? "orb-voice active" : "orb-voice"} disabled={!ready} title={voiceRecording || status.phase === "recording" ? "停止录音并发送" : "开始录音"} aria-label={voiceRecording || status.phase === "recording" ? "停止录音并发送" : "开始录音"} aria-pressed={voiceRecording || status.phase === "recording"} onClick={toggleVoice}>
-        {voiceRecording || status.phase === "recording" ? "■" : <svg aria-hidden="true" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="1.8"><rect x="9" y="3" width="6" height="12" rx="3" /><path d="M6 11v1a6 6 0 0 0 12 0v-1M12 18v3M9 21h6" /></svg>}
+      <button className={`orb-voice ${status.phase === "recording" && !captureFailed ? "active" : voicePending ? "preparing" : ""}`} disabled={!ready} title={`${voiceButtonLabel} · ${microphone.detail}`} aria-label={voiceButtonLabel} aria-pressed={voiceEngaged} onClick={toggleVoice}>
+        {voicePending ? "…" : status.phase === "recording" ? "■" : <svg aria-hidden="true" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="1.8"><rect x="9" y="3" width="6" height="12" rx="3" /><path d="M6 11v1a6 6 0 0 0 12 0v-1M12 18v3M9 21h6" /></svg>}
       </button>
       {speaking && <button title="停止播报" aria-label="停止播报" onClick={() => void command("interrupt")}>■</button>}
     </div>}

@@ -339,9 +339,21 @@ fn finish_recording(
     wav(samples, sample_rate).map(RecordedAudio::Speech)
 }
 
+#[derive(Clone, Serialize)]
+pub struct MicrophoneStatus {
+    pub phase: String,
+    pub detail: String,
+}
+fn mic_status(status: &Mutex<MicrophoneStatus>, phase: &str, detail: impl Into<String>) {
+    *status.lock().unwrap() = MicrophoneStatus {
+        phase: phase.into(),
+        detail: detail.into(),
+    };
+}
 enum RecordingCommand {
+    Configure(String),
     Start(String, mpsc::Sender<Result<(), String>>),
-    Stop(mpsc::Sender<Result<RecordedAudio, String>>),
+    Stop(mpsc::Sender<Result<RecordedAudio, String>>, bool),
 }
 
 pub struct Devices {
@@ -349,6 +361,7 @@ pub struct Devices {
     playback_generation: AtomicU64,
     audio_selection: Mutex<(String, String)>,
     input_level: Arc<AtomicU32>,
+    microphone_status: Arc<Mutex<MicrophoneStatus>>,
     volume: AtomicU32,
     playback_gate: Mutex<Option<Arc<rodio::Sink>>>,
 }
@@ -362,10 +375,16 @@ impl Devices {
         let (tx, rx) = mpsc::channel();
         let input_level = Arc::new(AtomicU32::new(0));
         let worker_level = input_level.clone();
-        thread::spawn(move || recording_worker(rx, worker_level));
+        let microphone_status = Arc::new(Mutex::new(MicrophoneStatus {
+            phase: "preparing".into(),
+            detail: "麦克风尚未初始化".into(),
+        }));
+        let worker_status = microphone_status.clone();
+        thread::spawn(move || recording_worker(rx, worker_level, worker_status));
         Self {
             recording: tx,
             input_level,
+            microphone_status,
             playback_generation: AtomicU64::new(0),
             audio_selection: Mutex::new((String::new(), String::new())),
             volume: AtomicU32::new(0.8_f32.to_bits()),
@@ -373,7 +392,11 @@ impl Devices {
         }
     }
     pub fn set_audio_devices(&self, input: String, output: String) {
-        *self.audio_selection.lock().unwrap() = (input, output);
+        *self.audio_selection.lock().unwrap() = (input.clone(), output);
+        let _ = self.recording.send(RecordingCommand::Configure(input));
+    }
+    pub fn microphone_status(&self) -> MicrophoneStatus {
+        self.microphone_status.lock().unwrap().clone()
     }
     pub fn input_level(&self) -> f32 {
         f32::from_bits(self.input_level.load(Ordering::Relaxed))
@@ -390,9 +413,15 @@ impl Devices {
         rx.recv().map_err(|_| "录音线程未响应")?
     }
     pub fn stop_recording(&self) -> Result<RecordedAudio, String> {
+        self.finish_capture(false)
+    }
+    pub fn stop_recording_with_tail(&self) -> Result<RecordedAudio, String> {
+        self.finish_capture(true)
+    }
+    fn finish_capture(&self, tail: bool) -> Result<RecordedAudio, String> {
         let (tx, rx) = mpsc::channel();
         self.recording
-            .send(RecordingCommand::Stop(tx))
+            .send(RecordingCommand::Stop(tx, tail))
             .map_err(|_| "录音线程已退出")?;
         rx.recv().map_err(|_| "录音线程未响应")?
     }
@@ -476,108 +505,318 @@ impl Devices {
     }
 }
 
-struct Recording {
-    stream: cpal::Stream,
-    samples: Arc<Mutex<Vec<i16>>>,
-    error: Arc<Mutex<Option<String>>>,
-    sample_rate: u32,
-    started: Instant,
+const RECORDING_LIMIT: Duration = Duration::from_secs(120);
+const MIC_STALE: Duration = Duration::from_secs(2);
+
+fn needs_capture_tail(tail: bool, held: Option<Duration>) -> bool {
+    tail && held.is_some_and(|held| {
+        held >= Duration::from_millis(300) && held + Duration::from_millis(100) < RECORDING_LIMIT
+    })
 }
-fn recording_worker(rx: mpsc::Receiver<RecordingCommand>, input_level: Arc<AtomicU32>) {
+
+struct CaptureSession {
+    samples: Vec<i16>,
+    started: Instant,
+    expired: bool,
+}
+#[derive(Default)]
+struct CaptureBuffer {
+    session: Option<CaptureSession>,
+}
+impl CaptureBuffer {
+    fn start(&mut self, samples: Vec<i16>, now: Instant) -> Result<(), String> {
+        if self.session.is_some() {
+            return Err("正在录音".into());
+        }
+        self.session = Some(CaptureSession {
+            samples,
+            started: now,
+            expired: false,
+        });
+        Ok(())
+    }
+    fn append(
+        &mut self,
+        samples: impl Iterator<Item = i16>,
+        max_samples: usize,
+        now: Instant,
+    ) -> bool {
+        let Some(session) = self.session.as_mut() else {
+            return false;
+        };
+        if session.expired || now.duration_since(session.started) >= RECORDING_LIMIT {
+            session.expired = true;
+            return true;
+        }
+        for sample in samples {
+            if session.samples.len() == max_samples {
+                session.expired = true;
+                return true;
+            }
+            session.samples.push(sample);
+        }
+        false
+    }
+}
+struct Recording {
+    _stream: cpal::Stream,
+    buffer: Arc<Mutex<CaptureBuffer>>,
+    error: Arc<Mutex<Option<String>>>,
+    heartbeat: Arc<AtomicU64>,
+    clock: Instant,
+    sample_rate: u32,
+    device_name: String,
+}
+impl Recording {
+    fn ready(&self) -> bool {
+        let last = self.heartbeat.load(Ordering::Relaxed);
+        last > 0
+            && self.clock.elapsed().as_millis() as u64 + 1 - last < MIC_STALE.as_millis() as u64
+    }
+    fn health_error(&self) -> Option<String> {
+        self.error.lock().unwrap().clone().or_else(|| {
+            (self.clock.elapsed() > MIC_STALE && !self.ready())
+                .then(|| "麦克风没有继续返回音频，正在重新连接".into())
+        })
+    }
+}
+fn recording_worker(
+    rx: mpsc::Receiver<RecordingCommand>,
+    input_level: Arc<AtomicU32>,
+    status: Arc<Mutex<MicrophoneStatus>>,
+) {
+    let mut selected: Option<String> = None;
     let mut current: Option<Recording> = None;
+    let mut pending: Option<(Instant, mpsc::Sender<Result<(), String>>)> = None;
     let mut stopped_reason: Option<String> = None;
+    let mut retry_at = Instant::now();
+    let mut default_check = Instant::now();
+    let mut retry_attempts = 0usize;
+    let mut device_present = None;
     loop {
-        let command = if let Some(recording) = current.as_ref() {
-            let remaining = Duration::from_secs(120).saturating_sub(recording.started.elapsed());
-            match rx.recv_timeout(remaining) {
-                Ok(command) => command,
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    // Close the native microphone even if an app-level timer was cancelled.
+        match rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(RecordingCommand::Configure(input)) => {
+                if selected.as_ref() != Some(&input) {
+                    if let Some((_, reply)) = pending.take() {
+                        let _ = reply.send(Err("输入设备已切换，请重新录音".into()));
+                    }
                     current = None;
+                    selected = Some(input);
+                    stopped_reason = Some("输入设备已切换，请重新录音".into());
+                    retry_at = Instant::now();
+                    retry_attempts = 0;
                     input_level.store(0, Ordering::Relaxed);
-                    stopped_reason = Some("录音达到两分钟，麦克风已停止，请重新按键说话".into());
+                    mic_status(&status, "preparing", "正在准备麦克风");
+                }
+            }
+            Ok(RecordingCommand::Start(input, reply)) => {
+                if pending.is_some()
+                    || current
+                        .as_ref()
+                        .is_some_and(|r| r.buffer.lock().unwrap().session.is_some())
+                {
+                    let _ = reply.send(Err("正在录音或准备麦克风".into()));
                     continue;
                 }
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            }
-        } else {
-            match rx.recv() {
-                Ok(command) => command,
-                Err(_) => break,
-            }
-        };
-        match command {
-            RecordingCommand::Start(selected, reply) => {
-                if current.is_some() {
-                    let _ = reply.send(Err("正在录音".into()));
-                    continue;
+                if selected.as_ref() != Some(&input) {
+                    current = None;
+                    selected = Some(input);
                 }
                 stopped_reason = None;
-                input_level.store(0, Ordering::Relaxed);
-                let result = begin_recording(input_level.clone(), &selected).map(|recording| {
-                    current = Some(recording);
-                });
-                let _ = reply.send(result);
+                retry_at = Instant::now();
+                retry_attempts = 0;
+                pending = Some((Instant::now(), reply));
+                mic_status(&status, "preparing", "正在准备麦克风，请稍候");
             }
-            RecordingCommand::Stop(reply) => {
-                let result = match current.take() {
-                    None => Err(stopped_reason
-                        .take()
-                        .unwrap_or_else(|| "当前没有录音".into())),
-                    Some(recording) => {
-                        drop(recording.stream);
-                        let error = recording.error.lock().unwrap().take();
-                        let samples = recording.samples.lock().unwrap();
-                        match error {
+            Ok(RecordingCommand::Stop(reply, tail)) => {
+                let held = current.as_ref().and_then(|r| {
+                    r.buffer
+                        .lock()
+                        .unwrap()
+                        .session
+                        .as_ref()
+                        .map(|s| s.started.elapsed())
+                });
+                if needs_capture_tail(tail, held) {
+                    thread::sleep(Duration::from_millis(100));
+                }
+                if let Some((_, start_reply)) = pending.take() {
+                    let _ = start_reply.send(Err("录音已取消".into()));
+                }
+                let result = current
+                    .as_ref()
+                    .and_then(|r| {
+                        r.buffer
+                            .lock()
+                            .unwrap()
+                            .session
+                            .take()
+                            .map(|session| (r, session))
+                    })
+                    .map(|(r, session)| {
+                        match r.health_error().or_else(|| {
+                            session
+                                .expired
+                                .then(|| "录音达到两分钟，已停止收集，请重新按键说话".into())
+                        }) {
                             Some(error) => Err(error),
                             None => finish_recording(
-                                &samples,
-                                recording.sample_rate,
-                                recording.started.elapsed(),
+                                &session.samples,
+                                r.sample_rate,
+                                held.unwrap_or_else(|| session.started.elapsed()),
                             ),
                         }
-                    }
-                };
+                    })
+                    .unwrap_or_else(|| {
+                        Err(stopped_reason
+                            .take()
+                            .unwrap_or_else(|| "当前没有录音".into()))
+                    });
                 input_level.store(0, Ordering::Relaxed);
                 let _ = reply.send(result);
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        if let Some(r) = current.as_ref() {
+            let mut failure = r.health_error();
+            if selected.as_deref() == Some("") && default_check.elapsed() >= Duration::from_secs(2)
+            {
+                default_check = Instant::now();
+                let name = selected_audio_device("", true)
+                    .and_then(|d| d.name().map_err(|e| e.to_string()));
+                if name.as_deref() != Ok(r.device_name.as_str()) {
+                    failure = Some("系统默认麦克风已变化，正在重新连接".into());
+                }
+            }
+            if let Some(error) = failure {
+                stopped_reason = Some(error.clone());
+                current = None;
+                input_level.store(0, Ordering::Relaxed);
+                mic_status(&status, "error", error);
+                retry_at = Instant::now() + Duration::from_secs(2);
+            }
+        }
+        // After bounded failures, only device reappearance or an explicit Start
+        // retries opening. Merely polling availability never requests permission.
+        if current.is_none()
+            && retry_attempts >= 3
+            && default_check.elapsed() >= Duration::from_secs(2)
+        {
+            default_check = Instant::now();
+            if let Some(input) = selected.as_ref() {
+                let present = selected_audio_device(input, true).is_ok();
+                if device_present == Some(false) && present {
+                    retry_attempts = 0;
+                }
+                device_present = Some(present);
+            }
+        }
+        if current.is_none() && retry_attempts < 3 && Instant::now() >= retry_at {
+            if let Some(input) = selected.as_ref() {
+                mic_status(&status, "preparing", "正在准备麦克风");
+                retry_attempts += 1;
+                match begin_recording(input_level.clone(), input) {
+                    Ok(stream) => current = Some(stream),
+                    Err(error) => {
+                        device_present = Some(selected_audio_device(input, true).is_ok());
+                        stopped_reason = Some(error.clone());
+                        mic_status(&status, "error", error);
+                    }
+                }
+                retry_at = Instant::now() + Duration::from_secs(2);
+            }
+        }
+        if pending
+            .as_ref()
+            .is_some_and(|(started, _)| started.elapsed() >= Duration::from_secs(3))
+        {
+            let (_, reply) = pending.take().unwrap();
+            let error = stopped_reason
+                .clone()
+                .unwrap_or_else(|| "麦克风准备超时，请检查设备和录音权限后重试".into());
+            let _ = reply.send(Err(error));
+        }
+        if let Some(r) = current.as_ref() {
+            if r.ready() {
+                retry_attempts = 0;
+                if let Some((_, reply)) = pending.take() {
+                    // Allocate on the worker, never inside the audio callback.
+                    let samples = Vec::with_capacity(r.sample_rate as usize * 120);
+                    let result = r.buffer.lock().unwrap().start(samples, Instant::now());
+                    let _ = reply.send(result);
+                }
+                let mut buffer = r.buffer.lock().unwrap();
+                if buffer
+                    .session
+                    .as_ref()
+                    .is_some_and(|s| s.expired || s.started.elapsed() >= RECORDING_LIMIT)
+                {
+                    buffer.session = None;
+                    stopped_reason = Some("录音达到两分钟，已停止收集，请重新按键说话".into());
+                    input_level.store(0, Ordering::Relaxed);
+                }
+                if buffer.session.is_some() {
+                    mic_status(&status, "recording", "正在听你说");
+                } else {
+                    mic_status(&status, "ready", "麦克风已就绪，待命声音不保存、不上传");
+                }
             }
         }
     }
 }
 fn begin_recording(input_level: Arc<AtomicU32>, selected: &str) -> Result<Recording, String> {
     let device = selected_audio_device(selected, true)?;
+    let device_name = device.name().map_err(|e| e.to_string())?;
     let supported = device
         .default_input_config()
         .map_err(|e| format!("无法打开麦克风，请检查权限：{e}"))?;
     let format = supported.sample_format();
     let config: cpal::StreamConfig = supported.into();
-    let samples = Arc::new(Mutex::new(Vec::new()));
+    let buffer = Arc::new(Mutex::new(CaptureBuffer::default()));
     let error = Arc::new(Mutex::new(None));
+    let heartbeat = Arc::new(AtomicU64::new(0));
+    let clock = Instant::now();
     let channels = config.channels as usize;
     let max_samples = config.sample_rate.0 as usize * 120;
     macro_rules! build {
         ($ty:ty, $convert:expr) => {{
-            let out = Arc::clone(&samples);
-            let errors = Arc::clone(&error);
-            let overflow = Arc::clone(&error);
+            let out = buffer.clone();
+            let errors = error.clone();
             let level = input_level.clone();
-            device.build_input_stream(&config, move |data: &[$ty], _: &cpal::InputCallbackInfo| {
-                let mut out = out.lock().unwrap();
-                let mut energy = 0.0_f32;
-                let mut count = 0usize;
-                for frame in data.chunks_exact(channels) {
-                    if out.len() >= max_samples {
-                        *overflow.lock().unwrap() = Some("单次录音超过 120 秒，请松开后重新录制".into());
-                        break;
+            let pulse = heartbeat.clone();
+            device.build_input_stream(
+                &config,
+                move |data: &[$ty], _: &cpal::InputCallbackInfo| {
+                    if data.is_empty() {
+                        return;
                     }
-                    let average = frame.iter().map($convert).sum::<f32>() / channels as f32;
-                    energy += average * average;
-                    count += 1;
-                    out.push((average.clamp(-1.0, 1.0) * i16::MAX as f32) as i16);
-                }
-                let rms = if count == 0 { 0.0 } else { (energy / count as f32).sqrt() };
-                level.store((rms * 8.0).clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
-            }, move |err| { *errors.lock().unwrap() = Some(format!("麦克风中断：{err}")); }, None)
+                    pulse.store(clock.elapsed().as_millis() as u64 + 1, Ordering::Relaxed);
+                    let mut out = out.lock().unwrap();
+                    if out.session.is_none() {
+                        return;
+                    }
+                    let mut energy = 0.0_f32;
+                    let mut count = 0usize;
+                    let samples = data.chunks_exact(channels).map(|frame| {
+                        let average = frame.iter().map($convert).sum::<f32>() / channels as f32;
+                        energy += average * average;
+                        count += 1;
+                        (average.clamp(-1.0, 1.0) * i16::MAX as f32) as i16
+                    });
+                    out.append(samples, max_samples, Instant::now());
+                    let rms = if count == 0 {
+                        0.0
+                    } else {
+                        (energy / count as f32).sqrt()
+                    };
+                    level.store((rms * 8.0).clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
+                },
+                move |err| {
+                    *errors.lock().unwrap() = Some(format!("麦克风中断：{err}"));
+                },
+                None,
+            )
         }};
     }
     let stream = match format {
@@ -589,11 +828,13 @@ fn begin_recording(input_level: Arc<AtomicU32>, selected: &str) -> Result<Record
     .map_err(|e| format!("创建录音流失败：{e}"))?;
     stream.play().map_err(|e| format!("启动麦克风失败：{e}"))?;
     Ok(Recording {
-        stream,
-        samples,
+        _stream: stream,
+        buffer,
         error,
+        heartbeat,
+        clock,
         sample_rate: config.sample_rate.0,
-        started: Instant::now(),
+        device_name,
     })
 }
 fn wav(samples: &[i16], sample_rate: u32) -> Result<Vec<u8>, String> {
@@ -617,6 +858,51 @@ fn wav(samples: &[i16], sample_rate: u32) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn capture_gate_discards_idle_audio_and_never_carries_between_turns() {
+        let mut capture = CaptureBuffer::default();
+        let now = Instant::now();
+        assert!(!capture.append([1, 2, 3].into_iter(), 8, now));
+        assert!(capture.session.is_none());
+        capture.start(Vec::with_capacity(8), now).unwrap();
+        assert!(!capture.append([4, 5].into_iter(), 8, now));
+        assert_eq!(capture.session.take().unwrap().samples, vec![4, 5]);
+        capture.append([6, 7].into_iter(), 8, now);
+        capture.start(Vec::with_capacity(8), now).unwrap();
+        capture.append([8].into_iter(), 8, now);
+        assert_eq!(capture.session.take().unwrap().samples, vec![8]);
+    }
+    #[test]
+    fn capture_limit_stops_accepting_samples_without_growing_buffer() {
+        let mut capture = CaptureBuffer::default();
+        let now = Instant::now();
+        capture.start(Vec::with_capacity(2), now).unwrap();
+        assert!(capture.append([1, 2, 3].into_iter(), 2, now));
+        assert_eq!(capture.session.as_ref().unwrap().samples, vec![1, 2]);
+        assert!(capture.session.as_ref().unwrap().expired);
+        capture.session = None;
+        capture.start(Vec::with_capacity(2), now).unwrap();
+        assert!(capture.append([1].into_iter(), 2, now + RECORDING_LIMIT));
+        assert!(capture.session.as_ref().unwrap().samples.is_empty());
+        assert!(capture.session.as_ref().unwrap().expired);
+    }
+    #[test]
+    fn tail_is_only_for_explicit_nonaccidental_send_within_limit() {
+        assert!(needs_capture_tail(true, Some(Duration::from_millis(300))));
+        assert!(!needs_capture_tail(false, Some(Duration::from_secs(1))));
+        assert!(!needs_capture_tail(true, Some(Duration::from_millis(299))));
+        assert!(!needs_capture_tail(true, Some(RECORDING_LIMIT)));
+        assert!(!needs_capture_tail(true, None));
+    }
+    #[test]
+    fn duplicate_capture_start_does_not_clear_existing_audio() {
+        let mut capture = CaptureBuffer::default();
+        let now = Instant::now();
+        capture.start(Vec::with_capacity(2), now).unwrap();
+        capture.append([9].into_iter(), 2, now);
+        assert!(capture.start(Vec::with_capacity(2), now).is_err());
+        assert_eq!(capture.session.unwrap().samples, vec![9]);
+    }
     #[test]
     fn saved_audio_selection_survives_reordering_and_never_falls_back() {
         assert_eq!(

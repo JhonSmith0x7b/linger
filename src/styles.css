@@ -1558,3 +1558,12 @@ html.orb-document, .orb-document body, .orb-document #root { margin: 0; min-widt
 
 .conversation-reset { padding: 4px 20px; flex-shrink: 0; text-align: right; }
 .conversation-reset p { text-align: left; font-size: 12px; line-height: 1.6; margin: 4px 0; }
+
+.ptt-button.preparing, .orb-tools .orb-voice.preparing {
+  background: #eee9dd;
+  color: #75664b;
+  border-color: #c8bca5;
+}
+.microphone-status { color: #52735f; font-size: 13px; }
+.microphone-status.preparing { color: #75664b; }
+.microphone-status.error { color: #a3493c; }
