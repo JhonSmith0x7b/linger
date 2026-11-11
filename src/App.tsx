@@ -1,3 +1,4 @@
+import { translationStyles } from "./translationStyles";
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { FormEvent, ReactNode } from "react";
 import { invoke, isTauri } from "@tauri-apps/api/core";
@@ -10,13 +11,16 @@ import type {
   ObservationStatus,
   Settings,
   Status,
-  VoiceProfile,
+  CharacterTts,
 } from "./types";
 import { characters, characterFor, defaultVoiceProfile } from "./characters";
 import { MarkdownText } from "./MarkdownText";
 import { FloatingPanel } from "./FloatingPanel";
+import { UserProfileEditor } from "./UserProfileEditor";
 import { ScreenSourcePicker, sourceLabel } from "./ScreenSourcePicker";
 import { ShortcutRecorder } from "./ShortcutRecorder";
+import { CharacterVoiceEditor, TtsConnections } from "./TtsSettings";
+import { characterTts } from "./tts";
 
 const defaults: Settings = {
   base_url: "https://api.openai.com/v1",
@@ -27,6 +31,8 @@ const defaults: Settings = {
   translation_model: "gpt-4.1-mini",
   translation_language: "英语",
   translation_auto_copy: false,
+  translation_style: "casual",
+  translation_custom_prompt: "",
   response_format: "pcm",
   volume: 0.8,
   audio_input_device: "",
@@ -37,6 +43,7 @@ const defaults: Settings = {
   character_voices: { custom: defaultVoiceProfile() },
   observation_minutes: 2,
   observing: false,
+  compact_visible: true,
   capture_source: "monitor:primary",
   watch_instruction: "",
   shortcut: "CommandOrControl+Shift+Space",
@@ -155,6 +162,17 @@ export default function App() {
   const [draft, setDraft] = useState<Settings>(defaults);
   const [settingsTab, setSettingsTab] = useState("connection");
   const [messages, setMessages] = useState<Message[]>([]);
+  const [conversationEpoch, setConversationEpoch] = useState(0);
+  const [confirmClear, setConfirmClear] = useState(false);
+  const [clearingConversation, setClearingConversation] = useState(false);
+  const clearingRef = useRef(false);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [hasOlderMessages, setHasOlderMessages] = useState(false);
+  const [browsingHistory, setBrowsingHistory] = useState(false);
+  const historyMode = useRef(false);
+  const historyRequest = useRef(0);
+  const historyInFlight = useRef(false);
+  const messageList = useRef<HTMLDivElement>(null);
   const [memories, setMemories] = useState<Memory[]>([]);
   const [sources, setSources] = useState<CaptureSource[]>([]);
   const [audioDevices, setAudioDevices] = useState<AudioDevices>({ inputs: [], outputs: [] });
@@ -181,10 +199,8 @@ export default function App() {
   const [modelQuery, setModelQuery] = useState("");
   const modelRequest = useRef(0);
   const roleDrafts = useRef<Record<string, string>>({});
-  const voiceDrafts = useRef<Record<string, VoiceProfile>>({});
-  const [cardVoice, setCardVoice] = useState<VoiceProfile>(
-    defaultVoiceProfile(),
-  );
+  const ttsDrafts = useRef<Record<string, CharacterTts>>({});
+  const [cardTts, setCardTts] = useState<CharacterTts>(() => characterTts(defaults, "custom"));
   const pendingVolume = useRef<number | null>(null);
   const volumeInFlight = useRef(false);
   const volumeRef = useRef(defaults.volume);
@@ -320,11 +336,11 @@ export default function App() {
           "linger:message",
           ({ payload }) => {
             setStreamText("");
-            setMessages((old) =>
-              [...old.filter((m) => m.id !== payload.id), payload].sort(
-                (a, b) => a.id - b.id,
-              ),
-            );
+            if (payload.role === "user" && historyMode.current) resumeLatestHistory();
+            if (!historyMode.current) setMessages((old) => {
+              const updated = [...old.filter((m) => m.id !== payload.id), payload].sort((a, b) => a.id - b.id);
+              return updated.slice(-(compact ? 30 : 50));
+            });
           },
         );
         if (disposed) {
@@ -337,6 +353,7 @@ export default function App() {
           "linger:status",
           ({ payload }) => {
             receivedStatus = true;
+            if (payload.phase === "recording" && historyMode.current) resumeLatestHistory();
             setStatus(payload);
             if (
               ["idle", "error", "stopped", "recording"].includes(payload.phase)
@@ -375,6 +392,9 @@ export default function App() {
         });
         if (disposed) { stopOpenSettings(); return; }
         cleanups.push(stopOpenSettings);
+        const stopClear = await listen("linger:conversation-cleared", resetConversationView);
+        if (disposed) { stopClear(); return; }
+        cleanups.push(stopClear);
         const stopDelta = await listen<{ text: string }>(
           "linger:delta",
           ({ payload }) => setStreamText((old) => old + payload.text),
@@ -397,6 +417,7 @@ export default function App() {
             setDraft((previous) => ({
               ...previous,
               observing: payload.observing,
+              compact_visible: payload.compact_visible,
               translation_auto_copy: payload.translation_auto_copy,
               capture_source: previous.capture_source === priorSource ? payload.capture_source : previous.capture_source,
               volume,
@@ -408,10 +429,11 @@ export default function App() {
           return;
         }
         cleanups.push(stopSettings);
+        const initialHistoryRequest = historyRequest.current;
         const [initialSettings, initialMessages, keyExists] = await Promise.all(
           [
             invoke<Settings>("get_settings"),
-            invoke<Message[]>("list_messages"),
+            invoke<Message[]>("list_messages", { limit: compact ? 30 : 50 }),
             invoke<boolean>("key_status"),
           ],
         );
@@ -425,20 +447,20 @@ export default function App() {
           [initialSettings.character_id || "custom"]:
             initialSettings.personality,
         };
-        voiceDrafts.current = { ...initialSettings.character_voices };
+        ttsDrafts.current = { ...initialSettings.character_tts };
         const initialCharacter = initialSettings.character_id || "custom";
-        setCardVoice(
-          voiceDrafts.current[initialCharacter] ??
-            defaultVoiceProfile(initialCharacter),
-        );
+        setCardTts(characterTts(initialSettings, initialCharacter));
         setHasKey(keyExists);
+        if (initialHistoryRequest === historyRequest.current) {
         setMessages((old) =>
           Array.from(
             new Map(
               [...initialMessages, ...old].map((m) => [m.id, m]),
             ).values(),
-          ).sort((a, b) => a.id - b.id),
+          ).sort((a, b) => a.id - b.id).slice(-(compact ? 30 : 50)),
         );
+        setHasOlderMessages(initialMessages.length >= 50);
+        }
         setReady(true);
         if (keyExists && !compact) void loadModels(initialSettings.base_url);
       } catch (e) {
@@ -453,8 +475,63 @@ export default function App() {
     };
   }, [desktop, report, loadModels, compact]);
   useEffect(() => {
-    bottom.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages, page]);
+    if (browsingHistory) {
+      if (messageList.current) messageList.current.scrollTop = 0;
+    } else bottom.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages, page, browsingHistory]);
+  useEffect(() => {
+    if (!compact && !browsingHistory && messages.length >= 50) setHasOlderMessages(true);
+  }, [compact, browsingHistory, messages.length]);
+  function resetConversationView() {
+    historyRequest.current += 1; historyInFlight.current = false; historyMode.current = false;
+    setMessages([]); setStreamText(""); setInput(""); setError("");
+    setHistoryLoading(false); setHasOlderMessages(false); setBrowsingHistory(false);
+    setConfirmClear(false); setObservationStatus(null);
+    holding.current = false; setHeld(false);
+    setConversationEpoch(epoch => epoch + 1);
+  }
+  async function clearConversation() {
+    if (clearingRef.current) return;
+    clearingRef.current = true; setClearingConversation(true); setError("");
+    try {
+      await invoke("clear_conversation");
+      // Native success emits the reset event to every window.
+      setConfirmClear(false);
+      setNotice("对话与近期摘要已清空，角色设定、用户档案和记忆已保留。");
+    } catch (error) { report(error); }
+    finally { clearingRef.current = false; setClearingConversation(false); }
+  }
+  function resumeLatestHistory() {
+    if (!historyMode.current) return;
+    historyMode.current = false;
+    setBrowsingHistory(false); setMessages([]);
+    void loadHistory(undefined, true);
+  }
+  async function loadHistory(beforeId?: number, supersede = false) {
+    if (historyInFlight.current && !supersede) return;
+    historyInFlight.current = true; setHistoryLoading(true);
+    const request = ++historyRequest.current;
+    const wasHistorical = historyMode.current;
+    // Keep live events from changing the page while an older snapshot is fetched.
+    historyMode.current = beforeId !== undefined;
+    try {
+      const batch = await invoke<Message[]>("list_messages", { beforeId, limit: 50 });
+      if (request !== historyRequest.current) return;
+      if (beforeId !== undefined && batch.length === 0) {
+        historyMode.current = wasHistorical;
+        setHasOlderMessages(false);
+        return;
+      }
+      setMessages(old => beforeId !== undefined ? batch.slice(-50) :
+        Array.from(new Map([...old, ...batch].map(m => [m.id, m])).values()).sort((a, b) => a.id - b.id).slice(-50));
+      setBrowsingHistory(beforeId !== undefined);
+      setHasOlderMessages(batch.length >= 50);
+    } catch (error) {
+      if (request === historyRequest.current) { historyMode.current = wasHistorical; report(error); }
+    } finally {
+      if (request === historyRequest.current) { historyInFlight.current = false; setHistoryLoading(false); }
+    }
+  }
   useEffect(() => {
     if (page === "memory" && ready) void refreshMemories();
     if (page === "settings") setNotice("");
@@ -483,9 +560,9 @@ export default function App() {
   };
   function selectCharacter(id: string) {
     roleDrafts.current[draft.character_id || "custom"] = draft.personality;
-    voiceDrafts.current[draft.character_id || "custom"] = cardVoice;
+    ttsDrafts.current[draft.character_id || "custom"] = cardTts;
     const preset = characterFor(id);
-    setCardVoice(voiceDrafts.current[id] ?? defaultVoiceProfile(id));
+    setCardTts(ttsDrafts.current[id] ?? characterTts(draft, id));
     setDraft((prev) => ({
       ...prev,
       character_id: id,
@@ -506,9 +583,9 @@ export default function App() {
           ...roleDrafts.current,
           [draft.character_id || "custom"]: draft.personality,
         },
-        character_voices: {
-          ...voiceDrafts.current,
-          [draft.character_id || "custom"]: cardVoice,
+        character_tts: {
+          ...ttsDrafts.current,
+          [draft.character_id || "custom"]: cardTts,
         },
       };
       await invoke("save_settings", { settings: savedSettings });
@@ -516,7 +593,7 @@ export default function App() {
       setDraft((previous) => ({
         ...previous,
         character_personalities: savedSettings.character_personalities,
-        character_voices: savedSettings.character_voices,
+        character_tts: savedSettings.character_tts,
       }));
       if (apiKey.trim()) {
         await invoke("set_api_key", { key: apiKey.trim() });
@@ -526,7 +603,7 @@ export default function App() {
       const keyExists = await invoke<boolean>("key_status");
       setHasKey(keyExists);
       roleDrafts.current[draft.character_id || "custom"] = draft.personality;
-      voiceDrafts.current[draft.character_id || "custom"] = cardVoice;
+      ttsDrafts.current[draft.character_id || "custom"] = cardTts;
       setNotice("设置已保存，下次请求使用新配置。");
       if (keyExists) void loadModels(draft.base_url);
     } catch (e) {
@@ -588,6 +665,7 @@ export default function App() {
     e.preventDefault();
     const text = input.trim();
     if (!text || !ready) return;
+    resumeLatestHistory();
     setInput("");
     setError("");
     try {
@@ -599,6 +677,7 @@ export default function App() {
   }
   function startRecording() {
     if (holding.current || !ready) return;
+    resumeLatestHistory();
     holding.current = true;
     setHeld(true);
     setError("");
@@ -670,7 +749,7 @@ export default function App() {
   </>;
 
   if (compact)
-    return <FloatingPanel settings={settings} messages={messages} streamText={streamText} ready={ready} status={status} error={error} onStartRecording={startRecording} onStopRecording={stopRecording} onToggleObserving={() => void toggleObserving()} observationBusy={observationBusy || sourceBusy} sourceControls={sourceControls} onSetTranslationAutoCopy={setTranslationAutoCopy} />;
+    return <FloatingPanel key={conversationEpoch} settings={settings} messages={messages} streamText={streamText} ready={ready} status={status} error={error} onStartRecording={startRecording} onStopRecording={stopRecording} onToggleObserving={() => void toggleObserving()} observationBusy={observationBusy || sourceBusy} sourceControls={sourceControls} onSetTranslationAutoCopy={setTranslationAutoCopy} />;
 
   return (
     <div className="app-shell">
@@ -814,7 +893,21 @@ export default function App() {
               </button>
             </div>
             <div className="observation-source-row">{sourceControls}</div>
-            <div className="messages" aria-live="polite" aria-label="对话记录">
+            <div className="conversation-reset">
+              {confirmClear ? <div role="group" aria-label="确认重新开始对话">
+                <p>清空全部聊天、主动陪伴记录、近期摘要和活动状态，并停止当前回复。角色设定、用户档案和记忆会保留。删除后无法恢复。</p>
+                <button type="button" className="text-button" disabled={clearingConversation} onClick={() => void clearConversation()}>{clearingConversation ? "正在清空…" : "确认清空对话"}</button>
+                <button type="button" className="text-button" disabled={clearingConversation} onClick={() => setConfirmClear(false)}>取消</button>
+              </div> : <button type="button" className="text-button" disabled={!ready} onClick={() => setConfirmClear(true)}>重新开始对话</button>}
+            </div>
+            <div ref={messageList} className="messages" aria-live="polite" aria-label="对话记录">
+              {messages.length > 0 && <div className="translation-actions" aria-label="对话分页">
+                <button type="button" className="text-button" disabled={historyLoading || !hasOlderMessages}
+                  onClick={() => void loadHistory(messages[0]?.id)}>{historyLoading ? "加载中…" : hasOlderMessages ? "上一页 · 更早的对话" : "已到最早记录"}</button>
+                <small>每页最多 50 条</small>
+                {browsingHistory && <button type="button" className="text-button" disabled={historyLoading}
+                  onClick={() => void loadHistory()}>返回最新对话</button>}
+              </div>}
               {messages.length === 0 && (
                 <div className="empty-chat">
                   <div className="quiet-art">
@@ -840,7 +933,7 @@ export default function App() {
                     </button>
                   )}
                   <div className="suggestions">
-                    {["今天陪我一起工作吧", "记住，我喜欢简短自然的回应"].map(
+                    {["今天陪我一起工作吧", "记住，我喜欢自然、有来有往的聊天"].map(
                       (s) => (
                         <button key={s} onClick={() => setInput(s)}>
                           {s} <span>↗</span>
@@ -868,7 +961,7 @@ export default function App() {
                   <div className="message-body">{message.role === "user" ? message.content : <MarkdownText text={message.content} />}</div>
                 </article>
               ))}
-              {streamText && (
+              {!browsingHistory && streamText && (
                 <article className="message assistant">
                   <div className="message-meta">
                     <span>Linger</span>
@@ -877,7 +970,7 @@ export default function App() {
                   <div className="message-body"><MarkdownText text={streamText} /></div>
                 </article>
               )}
-              {busy && (
+              {!browsingHistory && busy && (
                 <div className="working-indicator">
                   <span className="pulse-dot" />
                   {status.detail || phaseLabel}
@@ -935,11 +1028,11 @@ export default function App() {
               <div className="voice-row">
                 <button
                   className="text-button floating-button"
-                  title="打开置顶面板：对话记录、按键语音、快捷翻译"
+                  title={settings.compact_visible ? "隐藏悬浮球，下次启动保持隐藏" : "显示悬浮球：对话记录、语音、快捷翻译"}
                   disabled={!ready}
                   onClick={() => void run("toggle_compact")}
                 >
-                  悬浮面板 ↗
+                  {settings.compact_visible ? "隐藏悬浮球" : "显示悬浮球 ↗"}
                 </button>
                 <div className="shortcut-hint">
                   <kbd>
@@ -1011,6 +1104,7 @@ export default function App() {
                 <Icon name="refresh" />
               </button>
             </div>
+            <UserProfileEditor ready={ready} />
             <form className="memory-composer" onSubmit={saveMemory}>
               <label htmlFor="memory-input">
                 {editingMemory !== null ? "修改这条记忆" : "想让我记住什么？"}
@@ -1019,7 +1113,7 @@ export default function App() {
                 id="memory-input"
                 value={memoryInput}
                 onChange={(e) => setMemoryInput(e.target.value)}
-                placeholder="例如：工作时少提问，回应尽量简短。"
+                placeholder="例如：工作时少提问，聊天时可以分享自己的想法。"
                 rows={3}
               />
               <div>
@@ -1125,6 +1219,7 @@ export default function App() {
               {[
                 { id: "connection", label: "API 与模型" },
                 { id: "character", label: "角色卡" },
+                { id: "tts", label: "语音连接" },
                 { id: "audio", label: "音频设备" },
                 { id: "companion", label: "陪伴与屏幕" },
               ].map((tab) => (
@@ -1220,6 +1315,14 @@ export default function App() {
                     <input list="translation-languages" value={draft.translation_language} onChange={(e) => change("translation_language", e.target.value)} placeholder="例如：英语、日语、韩语" maxLength={80} />
                     <datalist id="translation-languages">{["英语", "日语", "韩语", "法语", "德语", "西班牙语"].map(language => <option key={language} value={language} />)}</datalist>
                   </Field>
+                  <Field label="默认翻译风格" help="保存后生效。保留原意、只输出译文；悬浮翻译框可临时切换风格。">
+                    <select value={draft.translation_style} onChange={e => change("translation_style", e.target.value as Settings["translation_style"])}>
+                      {translationStyles.map(style => <option key={style.value} value={style.value}>{style.label}</option>)}
+                    </select>
+                  </Field>
+                  <Field label="自定义翻译要求" help="选择自定义风格时使用，最多 1000 字。用于控制语气、措辞和术语，不改变原意。">
+                    <textarea value={draft.translation_custom_prompt} onChange={e => change("translation_custom_prompt", e.target.value)} maxLength={1000} rows={3} placeholder="例如：像游戏队友聊天，简短随意，保留游戏术语。" />
+                  </Field>
                   <label className="checkbox-label">
                     <input type="checkbox" checked={settings.translation_auto_copy || false} disabled={!ready || autoCopySaving || saving}
                       onChange={(e) => { void setTranslationAutoCopy(e.target.checked).catch(report); }} />
@@ -1246,7 +1349,6 @@ export default function App() {
                         ["conversation_model", "对话与视觉"],
                         ["asr_model", "语音识别 ASR"],
                         ["memory_model", "摘要与记忆整理"],
-                        ["tts_model", "语音生成 TTS"],
                         ["translation_model", "快捷翻译"],
                       ] as const
                     ).map(([field, label]) => (
@@ -1275,22 +1377,6 @@ export default function App() {
                       </Field>
                     ))}
                   </div>
-                  <details className="advanced">
-                    <summary>高级输出设置</summary>
-                    <Field label="输出格式 response_format">
-                      <select
-                        aria-label="输出格式 response_format"
-                        value={draft.response_format}
-                        onChange={(e) =>
-                          change("response_format", e.target.value)
-                        }
-                      >
-                        {["pcm", "wav", "mp3", "aac", "flac"].map((format) => (
-                          <option key={format}>{format}</option>
-                        ))}
-                      </select>
-                    </Field>
-                  </details>
                 </>
               )}
               {settingsTab === "character" && (
@@ -1383,122 +1469,13 @@ export default function App() {
                         恢复这张卡的默认设定
                       </button>
                     )}
-                    <div className="character-voice-editor">
-                      <div className="section-intro">
-                        <h2>
-                          {selectedCharacter?.name || "自定义角色"} · 声音
-                        </h2>
-                        <p>
-                          音色、语速与说话风格随这张角色卡保存。可以先试听，再决定是否保存。
-                        </p>
-                      </div>
-                      <div className="field-grid">
-                        <Field label="音色 voice">
-                          <select
-                            aria-label="音色 voice"
-                            value={cardVoice.voice}
-                            onChange={(e) =>
-                              setCardVoice((profile) => ({
-                                ...profile,
-                                voice: e.target.value,
-                              }))
-                            }
-                          >
-                            {[
-                              "alloy",
-                              "ash",
-                              "ballad",
-                              "coral",
-                              "echo",
-                              "fable",
-                              "onyx",
-                              "nova",
-                              "sage",
-                              "shimmer",
-                              "verse",
-                              "marin",
-                              "cedar",
-                            ].map((voice) => (
-                              <option key={voice}>{voice}</option>
-                            ))}
-                          </select>
-                        </Field>
-                        <Field
-                          label="语速 speed"
-                          help="1.0 为正常语速，支持 0.25–4.0。"
-                        >
-                          <input
-                            aria-label="语速 speed"
-                            type="number"
-                            required
-                            min="0.25"
-                            max="4"
-                            step="0.05"
-                            value={cardVoice.speed}
-                            onChange={(e) =>
-                              setCardVoice((profile) => ({
-                                ...profile,
-                                speed: Number(e.target.value),
-                              }))
-                            }
-                          />
-                        </Field>
-                      </div>
-                      <Field
-                        label="角色声音风格 instructions"
-                        help="描述这个角色的语气、情绪和表达节奏。"
-                      >
-                        <textarea
-                          aria-label="角色声音风格 instructions"
-                          rows={4}
-                          value={cardVoice.instructions}
-                          onChange={(e) =>
-                            setCardVoice((profile) => ({
-                              ...profile,
-                              instructions: e.target.value,
-                            }))
-                          }
-                        />
-                      </Field>
-                      <div className="voice-actions">
-                        <button
-                          type="button"
-                          className="secondary-button"
-                          disabled={
-                            !ready ||
-                            !Number.isFinite(cardVoice.speed) ||
-                            cardVoice.speed < 0.25 ||
-                            cardVoice.speed > 4
-                          }
-                          onClick={() =>
-                            void run("test_voice", { profile: cardVoice })
-                          }
-                        >
-                          <Icon name="mic" size={16} />
-                          试听当前角色声音
-                        </button>
-                        <button
-                          type="button"
-                          className="text-button"
-                          onClick={() =>
-                            setCardVoice(
-                              defaultVoiceProfile(
-                                draft.character_id || "custom",
-                              ),
-                            )
-                          }
-                        >
-                          恢复这张卡的默认声音
-                        </button>
-                      </div>
-                      <p className="region-hint">
-                        试听使用当前未保存的声音配置，以及已保存的 API 连接和
-                        TTS 模型；不会保存或切换角色。
-                      </p>
-                    </div>
+                    <CharacterVoiceEditor key={draft.character_id || "custom"} value={cardTts} onChange={setCardTts}
+                      settings={draft} characterId={draft.character_id || "custom"} characterName={selectedCharacter?.name || "自定义角色"}
+                      models={models} ready={ready} report={report} />
                   </div>
                 </>
               )}
+              {settingsTab === "tts" && <TtsConnections settings={draft} onChange={connections => change("tts_connections", connections)} ready={ready} report={report} />}
               {settingsTab === "audio" && (
                 <>
                   <div className="section-intro">

@@ -1528,3 +1528,33 @@ html.orb-document, .orb-document body, .orb-document #root { margin: 0; min-widt
 .orb-tools .orb-voice { display: grid; place-items: center; }
 .orb-tools .orb-voice.active { background: #f7d8d0; color: #9c453b; border-color: #d58b80; }
 .floating-translation .translation-auto-copy { display: flex; align-items: center; gap: 6px; font-size: 11px; margin-bottom: 12px; }
+
+/* Native geometry keeps the orb fixed; surrounding controls may open on either side. */
+.companion-layer[style] .companion-orb { left: calc(var(--orb-x) - 24px); top: calc(var(--orb-y) - 24px); right: auto; bottom: auto; }
+.companion-layer[style] .orb-translate-shortcut { left: calc(var(--translate-x) - 16px); top: calc(var(--orb-y) - 16px); right: auto; bottom: auto; }
+.companion-layer[style] .orb-tools { left: var(--tools-x); top: calc(var(--orb-y) - 24px); right: auto; bottom: auto; transform: translateX(-100%); }
+.companion-layer.controls-right[style] .orb-tools { transform: none; }
+.companion-layer[style] .orb-card, .companion-layer[style] .orb-bubble { left: var(--panel-x); top: var(--panel-y); right: auto; bottom: auto; width: var(--panel-width); height: var(--panel-height); box-sizing: border-box; }
+.mode-tools .orb-card > header { height: 34px; flex-basis: 34px; }
+.mode-tools .floating-chat { padding: 8px 12px; }
+.mode-tools .floating-message { margin-bottom: 8px; }
+
+/* Speech connections stay compact on narrow desktop windows. */
+.settings-tabs { flex-wrap: wrap; row-gap: 12px; }
+.tts-timing { color: var(--ink); font-size: 13px; overflow-wrap: anywhere; }
+
+.voice-library-list { display: grid; gap: 12px; margin-top: 16px; }
+.voice-library-item { padding: 14px; border: 1px solid var(--line); border-radius: 12px; min-width: 0; }
+.voice-library-title { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; overflow-wrap: anywhere; }
+.voice-library-title span { font-size: 11px; color: #60764f; }
+.voice-library-item > details { margin-bottom: 12px; font-size: 12px; }
+.voice-library-id { font-size: 11px; overflow-wrap: anywhere; user-select: text; }
+.voice-library-confirm { padding: 12px; margin-top: 10px; border: 1px solid #d9a99e; border-radius: 8px; background: #fff5f0; }
+.voice-library-delete { color: #9c453b; }
+.voice-library-list { max-height: 520px; overflow-y: auto; overscroll-behavior: contain; }
+
+.translation-style { display: flex; align-items: center; gap: 10px; font-size: 12px; margin-bottom: 10px; }
+.translation-style select { flex: 1; min-width: 0; padding: 5px 8px; font-size: 12px; }
+
+.conversation-reset { padding: 4px 20px; flex-shrink: 0; text-align: right; }
+.conversation-reset p { text-align: left; font-size: 12px; line-height: 1.6; margin: 4px 0; }

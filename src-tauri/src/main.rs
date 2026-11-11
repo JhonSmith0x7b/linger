@@ -3,11 +3,15 @@ mod api;
 mod credentials;
 mod devices;
 mod overlay;
+mod prompts;
 mod session;
 mod settings;
 mod shortcut_capture;
+mod speech_queue;
 mod speech_text;
 mod store;
+mod tts;
+mod voice_clone;
 
 use devices::{CaptureSource, Devices};
 use serde_json::json;
@@ -16,8 +20,8 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex,
 };
-use store::{Memory, Message, Store};
-use tauri::{Emitter, Manager, State};
+use store::{Memory, Message, Store, UserProfile};
+use tauri::{Emitter, Listener, Manager, State};
 use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 use tauri_plugin_opener::OpenerExt;
@@ -33,6 +37,7 @@ pub struct Core {
     turn_gate: Mutex<()>,
     recording_epoch: AtomicU64,
     observation_request: AtomicU64,
+    observation_activity: Mutex<std::time::Instant>,
     memory_retry_after: AtomicU64,
     busy: AtomicBool,
     recording: AtomicBool,
@@ -40,6 +45,8 @@ pub struct Core {
     last_frame: Mutex<Option<u64>>,
     activity: Mutex<String>,
     memory_busy: AtomicBool,
+    voice_clone_busy: AtomicBool,
+    voice_library_gate: tokio::sync::Mutex<()>,
     shortcut_capture: Mutex<shortcut_capture::ShortcutCapture>,
 }
 impl Core {
@@ -62,11 +69,48 @@ impl Core {
         let base = self.settings().base_url;
         api::Api::new(&base, &self.key_for(&base, false)?)
     }
+    fn speech_request(
+        &self,
+        settings: &Settings,
+        provider: String,
+        profile: settings::TtsProfile,
+        endpoint_override: Option<String>,
+    ) -> Result<session::SpeechRequest, String> {
+        profile.validate(&provider)?;
+        let endpoint = endpoint_override.unwrap_or_else(|| {
+            settings
+                .tts_connections
+                .get(&provider)
+                .map(|c| c.endpoint.clone())
+                .unwrap_or_default()
+        });
+        let endpoint = endpoint.trim().to_owned();
+        let (endpoint, key) = if provider == "openai" && endpoint.is_empty() {
+            (
+                format!("{}/audio/speech", settings.base_url.trim_end_matches('/')),
+                self.key_for(&settings.base_url, false)?,
+            )
+        } else {
+            let account = tts_credential_account(&provider, &endpoint)?;
+            (
+                endpoint,
+                self.key_for(&account, false)
+                    .map_err(|_| "请在语音连接中保存该地址的 API Key".to_string())?,
+            )
+        };
+        Ok(session::SpeechRequest {
+            provider,
+            profile,
+            endpoint,
+            key,
+        })
+    }
     fn interrupt(&self) {
         let _gate = self.turn_gate.lock().unwrap();
         self.interrupt_locked();
     }
     fn interrupt_locked(&self) {
+        *self.observation_activity.lock().unwrap() = std::time::Instant::now();
         let id = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         self.cancelled.send_replace(id);
         self.devices.stop_playback();
@@ -80,15 +124,18 @@ fn status(app: &tauri::AppHandle, phase: &str, detail: &str) {
     let value = json!({"phase":phase,"detail":detail});
     *app.state::<Arc<Core>>().last_status.lock().unwrap() = value.clone();
     let _ = app.emit("linger:status", value);
-    if matches!(phase, "recording" | "error")
+    if app.state::<Arc<Core>>().settings().compact_visible
+        && matches!(phase, "recording" | "error")
         && !app
             .get_webview_window("main")
             .is_some_and(|w| w.is_focused().unwrap_or(false))
     {
         let app = app.clone();
         tauri::async_runtime::spawn(async move {
-            if let Err(error) = show_compact(&app) {
-                eprintln!("无法显示录音状态：{error}");
+            if app.state::<Arc<Core>>().settings().compact_visible {
+                if let Err(error) = overlay::show(&app) {
+                    eprintln!("无法显示录音状态：{error}");
+                }
             }
         });
     }
@@ -119,7 +166,11 @@ fn copy_text(app: tauri::AppHandle, text: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn translate_text(core: State<'_, Arc<Core>>, text: String) -> Result<String, String> {
+async fn translate_text(
+    core: State<'_, Arc<Core>>,
+    text: String,
+    style: Option<String>,
+) -> Result<String, String> {
     let settings = core.settings();
     // Snapshot credentials and configuration together; translation is independent of companion turns.
     let key = core.key_for(&settings.base_url, false)?;
@@ -128,6 +179,8 @@ async fn translate_text(core: State<'_, Arc<Core>>, text: String) -> Result<Stri
         &settings.translation_model,
         &settings.translation_language,
         &text,
+        style.as_deref().unwrap_or(&settings.translation_style),
+        &settings.translation_custom_prompt,
     )
     .await
 }
@@ -184,17 +237,307 @@ fn set_api_key(core: State<Arc<Core>>, key: String) -> Result<(), String> {
             }
         })
 }
+// Separate namespace and exact destination binding prevent a TTS key from following an edited URI.
+fn tts_credential_account(provider: &str, endpoint: &str) -> Result<String, String> {
+    if !["openai", "cosyvoice", "minimax"].contains(&provider) {
+        return Err("未知语音服务".into());
+    }
+    let endpoint = endpoint.trim();
+    settings::validate_tts_endpoint(endpoint)?;
+    Ok(format!("tts:{provider}:{endpoint}"))
+}
+
+#[tauri::command]
+fn tts_key_status(core: State<Arc<Core>>, provider: String, endpoint: String) -> bool {
+    if provider == "openai" && endpoint.trim().is_empty() {
+        return core.key().is_ok();
+    }
+    tts_credential_account(&provider, &endpoint)
+        .and_then(|account| core.key_for(&account, false))
+        .is_ok()
+}
+
+#[tauri::command]
+fn save_tts_key(
+    core: State<Arc<Core>>,
+    provider: String,
+    endpoint: String,
+    key: String,
+) -> Result<(), String> {
+    let account = tts_credential_account(&provider, &endpoint)?;
+    let entry = key_entry(&account)?;
+    let key = key.trim();
+    core.credentials.write(
+        &account,
+        if key.is_empty() { None } else { Some(key) },
+        || {
+            if key.is_empty() {
+                match entry.delete_credential() {
+                    Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+                    Err(_) => Err("无法删除语音服务凭据".into()),
+                }
+            } else {
+                entry
+                    .set_password(key)
+                    .map_err(|_| "无法保存语音服务凭据，请检查系统凭据存储权限".into())
+            }
+        },
+    )
+}
+
+struct ReferenceVoiceGuard<'a>(&'a AtomicBool);
+impl Drop for ReferenceVoiceGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+fn reference_voice_meta_key(endpoint: &str, target_model: &str) -> Result<String, String> {
+    settings::validate_tts_endpoint(endpoint)?;
+    if ![
+        "cosyvoice-v2",
+        "cosyvoice-v3-plus",
+        "cosyvoice-v3-flash",
+        "cosyvoice-v3.5-plus",
+        "cosyvoice-v3.5-flash",
+    ]
+    .contains(&target_model)
+    {
+        return Err("请选择支持复刻的 CosyVoice 模型".into());
+    }
+    Ok(format!(
+        "reference_voice:{}:{}",
+        endpoint.trim(),
+        target_model
+    ))
+}
+
+fn reference_voice_uses(settings: &Settings, _endpoint: &str, voice_id: &str) -> Vec<String> {
+    // A workspace domain, legacy domain and LAN proxy may all address the same cloud account.
+    settings
+        .character_tts
+        .iter()
+        // Retired cards are compatibility backups, not selectable voice users.
+        .filter(|(id, _)| !matches!(id.as_str(), "rin" | "shiori" | "koharu"))
+        .filter_map(|(id, card)| {
+            card.profiles
+                .get("cosyvoice")
+                .filter(|profile| profile.voice == voice_id)
+                .map(|_| id.clone())
+        })
+        .collect()
+}
+fn local_reference_voices(
+    core: &Core,
+    endpoint: &str,
+) -> Result<Vec<store::ReferenceVoice>, String> {
+    voice_clone::customization_endpoint(endpoint)?;
+    let mut voices = core.store.list_reference_voices(endpoint.trim())?;
+    let settings = core.settings();
+    for voice in &mut voices {
+        voice.in_use_by = reference_voice_uses(&settings, endpoint, &voice.voice_id);
+    }
+    Ok(voices)
+}
+fn reference_voice_key(core: &Core, endpoint: &str) -> Result<String, String> {
+    let account = tts_credential_account("cosyvoice", endpoint)?;
+    core.key_for(&account, false)
+        .map_err(|_| "请先保存此 CosyVoice 地址的 API Key".into())
+}
+
+#[tauri::command]
+async fn create_reference_voice(
+    core: State<'_, Arc<Core>>,
+    endpoint: String,
+    target_model: String,
+    audio_base64: String,
+    mime_type: String,
+    name: Option<String>,
+) -> Result<serde_json::Value, String> {
+    core.voice_clone_busy
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .map_err(|_| "已有音色正在创建，请稍后重新查询，不要重复上传")?;
+    let _guard = ReferenceVoiceGuard(&core.voice_clone_busy);
+    let _library_guard = core
+        .voice_library_gate
+        .try_lock()
+        .map_err(|_| "音色库正在处理其他操作，请稍后重试")?;
+    let name = store::reference_voice_name(name.as_deref().unwrap_or("未命名参考音色"))?;
+    let meta_key = reference_voice_meta_key(&endpoint, &target_model)?;
+    let key = reference_voice_key(&core, &endpoint)?;
+    let voice_id =
+        voice_clone::create(&endpoint, &key, &target_model, &audio_base64, &mime_type).await?;
+    let record = store::ReferenceVoice {
+        voice_id: voice_id.clone(),
+        name: name.clone(),
+        target_model: target_model.clone(),
+        status: "DEPLOYING".into(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        in_use_by: Vec::new(),
+    };
+    core.store
+        .upsert_reference_voice(endpoint.trim(), &record)
+        .map_err(|_| format!("音色已创建，但本地记录保存失败，请保留音色 ID：{voice_id}"))?;
+    let result = json!({"voice_id":voice_id,"target_model":target_model,"name":name});
+    core.store
+        .set_meta(&meta_key, &result.to_string())
+        .map_err(|_| format!("音色已创建并加入音色库，但最近记录更新失败；音色 ID：{voice_id}"))?;
+    Ok(result)
+}
+
+#[tauri::command]
+fn get_reference_voice(
+    core: State<Arc<Core>>,
+    endpoint: String,
+    target_model: String,
+) -> Result<Option<serde_json::Value>, String> {
+    reference_voice_meta_key(&endpoint, &target_model)?;
+    Ok(local_reference_voices(&core, &endpoint)?
+        .into_iter()
+        .find(|v| v.target_model == target_model)
+        .map(|v| json!({"voice_id":v.voice_id,"target_model":v.target_model,"name":v.name})))
+}
+
+#[tauri::command]
+async fn query_reference_voice(
+    core: State<'_, Arc<Core>>,
+    endpoint: String,
+    voice_id: String,
+) -> Result<voice_clone::CloneStatus, String> {
+    let _guard = core.voice_library_gate.lock().await;
+    let key = reference_voice_key(&core, &endpoint)?;
+    let result = voice_clone::query(&endpoint, &key, &voice_id).await?;
+    if let Some(model) = result
+        .target_model
+        .clone()
+        .or_else(|| voice_clone::model_for_voice(&voice_id))
+    {
+        let record = store::ReferenceVoice {
+            voice_id,
+            name: "未命名参考音色".into(),
+            target_model: model,
+            status: result.status.clone(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            in_use_by: Vec::new(),
+        };
+        core.store
+            .upsert_reference_voice(endpoint.trim(), &record)?;
+    }
+    Ok(result)
+}
+
+#[tauri::command]
+async fn list_reference_voices(
+    core: State<'_, Arc<Core>>,
+    endpoint: String,
+    refresh_cloud: Option<bool>,
+) -> Result<Vec<store::ReferenceVoice>, String> {
+    let _guard = core.voice_library_gate.lock().await;
+    voice_clone::customization_endpoint(&endpoint)?;
+    core.store.list_reference_voices(endpoint.trim())?;
+    if refresh_cloud.unwrap_or(false) {
+        let key = reference_voice_key(&core, &endpoint)?;
+        let voices = voice_clone::list(&endpoint, &key).await?;
+        for voice in voices {
+            let record = store::ReferenceVoice {
+                name: format!(
+                    "参考音色 · {}",
+                    voice
+                        .voice_id
+                        .chars()
+                        .rev()
+                        .take(6)
+                        .collect::<String>()
+                        .chars()
+                        .rev()
+                        .collect::<String>()
+                ),
+                voice_id: voice.voice_id,
+                target_model: voice.target_model,
+                status: voice.status,
+                created_at: if voice.created_at.is_empty() {
+                    chrono::Utc::now().to_rfc3339()
+                } else {
+                    voice.created_at
+                },
+                in_use_by: Vec::new(),
+            };
+            core.store
+                .upsert_reference_voice(endpoint.trim(), &record)?;
+        }
+    }
+    local_reference_voices(&core, &endpoint)
+}
+
+#[tauri::command]
+fn rename_reference_voice(
+    core: State<Arc<Core>>,
+    endpoint: String,
+    voice_id: String,
+    name: String,
+) -> Result<(), String> {
+    let _guard = core
+        .voice_library_gate
+        .try_lock()
+        .map_err(|_| "音色库正在更新，请稍后重试")?;
+    voice_clone::customization_endpoint(&endpoint)?;
+    core.store
+        .rename_reference_voice(endpoint.trim(), &voice_id, &name)
+}
+
+#[tauri::command]
+async fn delete_reference_voice(
+    core: State<'_, Arc<Core>>,
+    endpoint: String,
+    voice_id: String,
+) -> Result<(), String> {
+    let _guard = core.voice_library_gate.lock().await;
+    let voices = local_reference_voices(&core, &endpoint)?;
+    let voice = voices
+        .iter()
+        .find(|v| v.voice_id == voice_id)
+        .ok_or("此音色不在当前连接的音色库中，请先刷新")?;
+    if !voice.in_use_by.is_empty() {
+        return Err("此音色仍被已保存的角色卡引用，请先更换这些角色的声音并保存，再删除".into());
+    }
+    let key = reference_voice_key(&core, &endpoint)?;
+    voice_clone::delete(&endpoint, &key, &voice_id).await?;
+    core.store
+        .delete_reference_voice(endpoint.trim(), &voice_id)
+        .map_err(|_| "云端音色已删除，但本地记录清理失败，请刷新音色库".into())
+}
+
 #[tauri::command]
 fn save_settings(
     app: tauri::AppHandle,
     core: State<Arc<Core>>,
     mut settings: Settings,
 ) -> Result<(), String> {
+    let _voice_guard = core
+        .voice_library_gate
+        .try_lock()
+        .map_err(|_| "音色库正在创建、查询或删除音色，请完成后再保存设置")?;
+    if let Some(connection) = settings.tts_connections.get("cosyvoice") {
+        for (id, card) in &settings.character_tts {
+            if matches!(id.as_str(), "rin" | "shiori" | "koharu") {
+                continue;
+            }
+            if let Some(profile) = card.profiles.get("cosyvoice") {
+                if core
+                    .store
+                    .reference_voice_deleted(connection.endpoint.trim(), &profile.voice)?
+                {
+                    return Err("角色卡引用了已删除的音色，请重新选择后保存".into());
+                }
+            }
+        }
+    }
     if core.shortcut_capture.lock().unwrap().active().is_some() {
         return Err("请先完成或取消快捷键录入，再保存设置".into());
     }
     settings.validate()?;
     let old = core.settings();
+    settings.compact_visible = old.compact_visible;
     let old_registered = app.global_shortcut().is_registered(old.shortcut.as_str());
     let new_shortcut = settings
         .shortcut
@@ -240,8 +583,52 @@ fn save_settings(
     Ok(())
 }
 #[tauri::command]
-fn list_messages(core: State<Arc<Core>>) -> Result<Vec<Message>, String> {
-    core.store.messages()
+fn list_messages(
+    core: State<Arc<Core>>,
+    before_id: Option<i64>,
+    limit: Option<usize>,
+) -> Result<Vec<Message>, String> {
+    core.store.message_page(before_id, limit.unwrap_or(50))
+}
+#[tauri::command]
+fn get_user_profile(core: State<Arc<Core>>) -> Result<UserProfile, String> {
+    core.store.user_profile()
+}
+#[tauri::command]
+fn save_user_profile(
+    app: tauri::AppHandle,
+    core: State<Arc<Core>>,
+    content: String,
+    expected_revision: i64,
+) -> Result<UserProfile, String> {
+    let _gate = core.turn_gate.lock().unwrap();
+    let profile = core.store.save_user_profile(&content, expected_revision)?;
+    core.interrupt_locked();
+    let _ = app.emit("linger:user-profile", &profile);
+    status(&app, "idle", "用户档案已更新");
+    Ok(profile)
+}
+#[tauri::command]
+fn clear_conversation(app: tauri::AppHandle, core: State<Arc<Core>>) -> Result<(), String> {
+    let _gate = core.turn_gate.lock().unwrap();
+    core.store.clear_conversation()?;
+    core.interrupt_locked();
+    core.recording_epoch.fetch_add(1, Ordering::SeqCst);
+    if core.recording.swap(false, Ordering::SeqCst) {
+        let _ = core.devices.stop_recording();
+    }
+    // Invalidate an outstanding permission/screenshot request as well as the turn.
+    core.observation_request.fetch_add(1, Ordering::SeqCst);
+    core.activity.lock().unwrap().clear();
+    *core.last_frame.lock().unwrap() = None;
+    core.memory_retry_after.store(0, Ordering::SeqCst);
+    let observation =
+        json!({"phase":"idle","detail":"对话已重置，等待下一次观察","at":null,"captured_at":null});
+    *core.observation_status.lock().unwrap() = observation.clone();
+    let _ = app.emit("linger:observation", observation);
+    let _ = app.emit("linger:conversation-cleared", ());
+    status(&app, "idle", "已重新开始对话，角色和用户记忆已保留");
+    Ok(())
 }
 #[tauri::command]
 fn list_memories(core: State<Arc<Core>>) -> Result<Vec<Memory>, String> {
@@ -303,11 +690,12 @@ fn start_recording(app: tauri::AppHandle, core: State<Arc<Core>>) -> Result<(), 
         status(&app, "error", "正在录入快捷键，暂不开始语音录音");
         return Err("正在录入快捷键，暂不开始语音录音".into());
     }
+    let _gate = core.turn_gate.lock().unwrap();
     if core.recording.swap(true, Ordering::SeqCst) {
         return Ok(());
     }
     drop(capture);
-    core.interrupt();
+    core.interrupt_locked();
     if let Err(e) = core.devices.start_recording() {
         core.recording.store(false, Ordering::SeqCst);
         status(&app, "error", &e);
@@ -331,10 +719,11 @@ fn start_recording(app: tauri::AppHandle, core: State<Arc<Core>>) -> Result<(), 
 }
 #[tauri::command]
 fn stop_recording(app: tauri::AppHandle, core: State<Arc<Core>>) -> Result<(), String> {
+    let gate = core.turn_gate.lock().unwrap();
     if !core.recording.swap(false, Ordering::SeqCst) {
         return Ok(());
     }
-    core.recording_epoch.fetch_add(1, Ordering::SeqCst);
+    let recording_epoch = core.recording_epoch.fetch_add(1, Ordering::SeqCst) + 1;
     let recording = core.devices.stop_recording().inspect_err(|e| {
         status(&app, "error", e);
     })?;
@@ -346,8 +735,9 @@ fn stop_recording(app: tauri::AppHandle, core: State<Arc<Core>>) -> Result<(), S
         devices::RecordedAudio::Silent => session::Trigger::Unheard,
         devices::RecordedAudio::Speech(wav) => session::Trigger::Audio(wav),
     };
+    drop(gate);
     core.key().inspect_err(|e| status(&app, "error", e))?;
-    session::launch(app, core.inner().clone(), trigger);
+    session::launch_recording(app, core.inner().clone(), trigger, recording_epoch);
     Ok(())
 }
 #[tauri::command]
@@ -467,22 +857,41 @@ async fn set_capture_source(
 }
 
 #[tauri::command]
-fn test_voice(
+async fn test_voice(
     app: tauri::AppHandle,
-    core: State<Arc<Core>>,
-    profile: settings::VoiceProfile,
-) -> Result<(), String> {
+    core: State<'_, Arc<Core>>,
+    tts_provider: Option<String>,
+    tts_profile: Option<settings::TtsProfile>,
+    tts_endpoint: Option<String>,
+    text: Option<String>,
+) -> Result<serde_json::Value, String> {
     if core.recording.load(Ordering::SeqCst) {
         return Err("请先结束录音".into());
     }
-    core.key()?;
-    profile.validate()?;
+    let settings = core.settings();
+    let (saved_provider, saved_profile) = settings.effective_tts()?;
+    let request = core.speech_request(
+        &settings,
+        tts_provider.unwrap_or(saved_provider),
+        tts_profile.unwrap_or(saved_profile),
+        tts_endpoint,
+    )?;
+    let text = text.unwrap_or_else(|| "我在这里，你可以安心做自己的事情。".into());
+    if text.trim().is_empty() || text.chars().count() > 1000 {
+        return Err("试听文本请填写 1–1000 个字符".into());
+    }
+    let (completion, result) = tokio::sync::oneshot::channel();
     session::launch(
         app,
         core.inner().clone(),
-        session::Trigger::Preview(profile),
+        session::Trigger::Preview {
+            request: Box::new(request),
+            text,
+            completion,
+        },
     );
-    Ok(())
+    let generation_ms = result.await.map_err(|_| "试听已打断".to_string())??;
+    Ok(json!({"generation_ms": generation_ms}))
 }
 
 #[tauri::command]
@@ -523,18 +932,34 @@ fn set_volume(app: tauri::AppHandle, core: State<Arc<Core>>, volume: f32) -> Res
     Ok(())
 }
 
-fn show_compact(app: &tauri::AppHandle) -> Result<(), String> {
-    overlay::show(app)
+fn set_compact_visible(app: &tauri::AppHandle, visible: bool) -> Result<(), String> {
+    if visible {
+        overlay::show(app)?;
+    } else if let Some(window) = app.get_webview_window("compact") {
+        window.hide().map_err(|e| e.to_string())?;
+    }
+    let core = app.state::<Arc<Core>>();
+    let updated = {
+        let mut settings = core.settings.lock().unwrap();
+        let mut updated = settings.clone();
+        updated.compact_visible = visible;
+        core.store
+            .save_settings(&serde_json::to_value(&updated).map_err(|e| e.to_string())?)?;
+        *settings = updated.clone();
+        updated
+    };
+    let _ = app.emit("linger:settings", updated);
+    Ok(())
 }
 
 #[tauri::command]
 async fn toggle_compact(app: tauri::AppHandle) -> Result<(), String> {
-    if let Some(window) = app.get_webview_window("compact") {
-        if window.is_visible().map_err(|e| e.to_string())? {
-            return window.hide().map_err(|e| e.to_string());
-        }
-    }
-    show_compact(&app)
+    let visible = app
+        .get_webview_window("compact")
+        .map(|window| window.is_visible().map_err(|e| e.to_string()))
+        .transpose()?
+        .unwrap_or(false);
+    set_compact_visible(&app, !visible)
 }
 
 #[tauri::command]
@@ -661,6 +1086,7 @@ fn main() {
                 turn_gate: Mutex::new(()),
                 recording_epoch: AtomicU64::new(0),
                 observation_request: AtomicU64::new(0),
+                observation_activity: Mutex::new(std::time::Instant::now()),
                 memory_retry_after: AtomicU64::new(0),
                 busy: AtomicBool::new(false),
                 recording: AtomicBool::new(false),
@@ -668,6 +1094,8 @@ fn main() {
                 last_frame: Mutex::new(None),
                 activity: Mutex::new(String::new()),
                 memory_busy: AtomicBool::new(false),
+                voice_clone_busy: AtomicBool::new(false),
+                voice_library_gate: tokio::sync::Mutex::new(()),
                 shortcut_capture: Mutex::new(shortcut_capture::ShortcutCapture::default()),
             });
             core.devices.set_volume(core.settings().volume);
@@ -681,11 +1109,19 @@ fn main() {
             let show =
                 tauri::menu::MenuItem::with_id(app, "show", "打开 Linger", true, None::<&str>)?;
             let panel =
-                tauri::menu::MenuItem::with_id(app, "panel", "打开悬浮面板", true, None::<&str>)?;
+                tauri::menu::MenuItem::with_id(app, "panel", if core.settings().compact_visible { "关闭悬浮窗" } else { "打开悬浮窗" }, true, None::<&str>)?;
             let pause =
-                tauri::menu::MenuItem::with_id(app, "pause", "暂停主动陪伴", true, None::<&str>)?;
+                tauri::menu::MenuItem::with_id(app, "pause", if core.settings().observing { "关闭主动陪伴" } else { "打开主动陪伴" }, true, None::<&str>)?;
             let quit = tauri::menu::MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
             let menu = tauri::menu::Menu::with_items(app, &[&show, &panel, &pause, &quit])?;
+            // All settings paths (including permission failure and auto-pause)
+            // publish this event. Read current state instead of a stale payload.
+            let tray_core = core.clone();
+            app.listen("linger:settings", move |_| {
+                let settings = tray_core.settings();
+                let _ = panel.set_text(if settings.compact_visible { "关闭悬浮窗" } else { "打开悬浮窗" });
+                let _ = pause.set_text(if settings.observing { "关闭主动陪伴" } else { "打开主动陪伴" });
+            });
             let icon = tauri::image::Image::new_owned([111, 163, 138, 255].repeat(32 * 32), 32, 32);
             tauri::tray::TrayIconBuilder::new()
                 .icon(icon)
@@ -695,7 +1131,7 @@ fn main() {
                     "panel" => {
                         let app = app.clone();
                         tauri::async_runtime::spawn(async move {
-                            if let Err(error) = show_compact(&app) {
+                            if let Err(error) = toggle_compact(app.clone()).await {
                                 status(&app, "error", &error);
                             }
                         });
@@ -709,7 +1145,10 @@ fn main() {
                     "pause" => {
                         let app = app.clone();
                         tauri::async_runtime::spawn(async move {
-                            let _ = set_observing(app.clone(), app.state(), false).await;
+                            let enabled = !app.state::<Arc<Core>>().settings().observing;
+                            if let Err(error) = set_observing(app.clone(), app.state(), enabled).await {
+                                status(&app, "error", &error);
+                            }
                         });
                     }
                     "quit" => {
@@ -719,6 +1158,9 @@ fn main() {
                     _ => {}
                 })
                 .build(app)?;
+            if core.settings().compact_visible {
+                overlay::show(app.handle()).map_err(std::io::Error::other)?;
+            }
             session::start_scheduler(app.handle().clone(), core);
             Ok(())
         })
@@ -740,7 +1182,13 @@ fn main() {
             }
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
-                let _ = window.hide();
+                if window.label() == "compact" {
+                    if let Err(e) = set_compact_visible(window.app_handle(), false) {
+                        status(window.app_handle(), "error", &e);
+                    }
+                } else {
+                    let _ = window.hide();
+                }
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -756,7 +1204,18 @@ fn main() {
             key_status,
             list_models,
             set_api_key,
+            tts_key_status,
+            save_tts_key,
+            create_reference_voice,
+            query_reference_voice,
+            get_reference_voice,
+            list_reference_voices,
+            rename_reference_voice,
+            delete_reference_voice,
             list_messages,
+            get_user_profile,
+            save_user_profile,
+            clear_conversation,
             list_memories,
             save_memory,
             update_memory,
@@ -784,4 +1243,115 @@ fn main() {
         ])
         .run(tauri::generate_context!())
         .expect("Linger 启动失败");
+}
+
+#[cfg(test)]
+mod tts_credentials_tests {
+    use super::tts_credential_account;
+
+    #[test]
+    fn every_saved_cosy_profile_blocks_deletion_even_inactive_or_via_an_endpoint_alias() {
+        let mut settings = super::Settings::default();
+        let (_, mut profile) = settings.effective_tts().unwrap();
+        profile.voice = "cosyvoice-v3-flash-linger-shared".into();
+        settings.character_tts.insert(
+            "haruhi".into(),
+            super::settings::CharacterTts {
+                provider: "openai".into(),
+                profiles: std::collections::BTreeMap::from([("cosyvoice".into(), profile)]),
+            },
+        );
+        assert_eq!(
+            super::reference_voice_uses(
+                &settings,
+                "https://different-cloud-alias/tts",
+                "cosyvoice-v3-flash-linger-shared"
+            ),
+            vec!["haruhi"]
+        );
+        settings
+            .character_tts
+            .insert("rin".into(), settings.character_tts["haruhi"].clone());
+        settings.character_tts.remove("haruhi");
+        assert!(super::reference_voice_uses(
+            &settings,
+            "https://different-cloud-alias/tts",
+            "cosyvoice-v3-flash-linger-shared"
+        )
+        .is_empty());
+        assert!(super::reference_voice_uses(
+            &settings,
+            "https://different-cloud-alias/tts",
+            "cosyvoice-v3-flash-linger-unused"
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn reference_voice_creation_guard_releases_on_error_or_completion() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let busy = AtomicBool::new(false);
+        {
+            assert!(busy
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok());
+            let _guard = super::ReferenceVoiceGuard(&busy);
+            assert!(busy
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err());
+        }
+        assert!(!busy.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn remembered_reference_voices_are_isolated_by_connection_and_model() {
+        let uri = "https://example.com/api/v1/services/audio/tts/SpeechSynthesizer";
+        assert_ne!(
+            super::reference_voice_meta_key(uri, "cosyvoice-v3-flash").unwrap(),
+            super::reference_voice_meta_key(uri, "cosyvoice-v3.5-flash").unwrap()
+        );
+        assert_ne!(
+            super::reference_voice_meta_key(uri, "cosyvoice-v3-flash").unwrap(),
+            super::reference_voice_meta_key(
+                &uri.replace("example.com", "other.example.com"),
+                "cosyvoice-v3-flash"
+            )
+            .unwrap()
+        );
+        assert!(super::reference_voice_meta_key(uri, "unknown").is_err());
+    }
+
+    #[test]
+    fn keys_are_bound_to_provider_and_exact_destination() {
+        let first = tts_credential_account("cosyvoice", "https://example.com/tts").unwrap();
+        assert_ne!(
+            first,
+            tts_credential_account("minimax", "https://example.com/tts").unwrap()
+        );
+        assert_ne!(
+            first,
+            tts_credential_account("cosyvoice", "https://example.com/other").unwrap()
+        );
+        assert_eq!(
+            first,
+            tts_credential_account("cosyvoice", " https://example.com/tts ").unwrap()
+        );
+        assert!(
+            tts_credential_account("openai", "http://192.168.1.2:3000/v1/audio/speech").is_ok()
+        );
+    }
+
+    #[test]
+    fn rejects_credential_bearing_or_invalid_destinations() {
+        for endpoint in [
+            "",
+            "file:///tmp/tts",
+            "https://key@example.com/tts",
+            "https://example.com/tts?key=secret",
+            "https://example.com/tts#fragment",
+        ] {
+            assert!(tts_credential_account("cosyvoice", endpoint).is_err());
+        }
+        assert!(tts_credential_account("unknown", "https://example.com/tts").is_err());
+    }
 }

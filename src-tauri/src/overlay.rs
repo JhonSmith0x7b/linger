@@ -1,5 +1,5 @@
 //! Small transparent desktop surface. Only painted controls intercept pointer input.
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Mutex,
@@ -21,7 +21,7 @@ impl Layout {
     fn size(self) -> (f64, f64) {
         match self {
             Self::Orb => (96.0, 56.0),
-            Self::Tools => (280.0, 72.0),
+            Self::Tools => (320.0, 320.0),
             Self::Bubble => (320.0, 132.0),
             Self::Chat | Self::Translate | Self::More => (320.0, 440.0),
         }
@@ -33,6 +33,85 @@ pub struct Overlay {
     interacting: AtomicBool,
     ignored: AtomicBool,
     hit_regions: Mutex<Option<HitRegions>>,
+    placement: Mutex<Option<Placement>>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct Placement {
+    width: f64,
+    height: f64,
+    orb_x: f64,
+    orb_y: f64,
+    panel_x: f64,
+    panel_y: f64,
+    panel_width: f64,
+    panel_height: f64,
+    controls_left: bool,
+}
+
+// Preserve the orb's desktop center. Only the surrounding surface moves/resizes.
+fn placement(
+    mode: Layout,
+    anchor: (f64, f64),
+    scale: f64,
+    work: [f64; 4],
+) -> ((f64, f64), Placement) {
+    let (left, top, right, bottom) = (work[0], work[1], work[0] + work[2], work[1] + work[3]);
+    let row_width = if mode == Layout::Tools { 280.0 } else { 96.0 };
+    let controls_left = anchor.0 - left >= (row_width - 28.0) * scale;
+    let row_left = anchor.0
+        - if controls_left {
+            row_width - 28.0
+        } else {
+            28.0
+        } * scale;
+    let row_top = anchor.1 - 28.0 * scale;
+    let panel_height = if mode == Layout::Orb {
+        0.0
+    } else {
+        (mode.size().1 - 64.0).min((work[3] / scale - 64.0).max(1.0))
+    };
+    let panel_width = 320.0_f64.min(work[2] / scale);
+    let panel_left = (anchor.0 - (panel_width - 28.0) * scale)
+        .clamp(left, (right - panel_width * scale).max(left));
+    let above = anchor.1 - top >= (panel_height + 36.0) * scale;
+    let panel_top = if above {
+        anchor.1 - (panel_height + 36.0) * scale
+    } else {
+        anchor.1 + 36.0 * scale
+    };
+    // If neither side fits (small monitor), reduce panel height to available space.
+    let panel_height = if above {
+        panel_height
+    } else {
+        panel_height.min(((bottom - panel_top) / scale).max(1.0))
+    };
+    let (x, y, width, height) = if mode == Layout::Orb {
+        (row_left, row_top, row_width, 56.0)
+    } else {
+        let x = row_left.min(panel_left);
+        let y = row_top.min(panel_top);
+        (
+            x,
+            y,
+            ((row_left + row_width * scale).max(panel_left + panel_width * scale) - x) / scale,
+            ((row_top + 56.0 * scale).max(panel_top + panel_height * scale) - y) / scale,
+        )
+    };
+    (
+        (x, y),
+        Placement {
+            width,
+            height,
+            orb_x: (anchor.0 - x) / scale,
+            orb_y: (anchor.1 - y) / scale,
+            panel_x: (panel_left - x) / scale,
+            panel_y: (panel_top - y) / scale,
+            panel_width,
+            panel_height,
+            controls_left,
+        },
+    )
 }
 
 // WebView CSS pixels need not equal native logical pixels (Windows zoom/DPI).
@@ -121,12 +200,6 @@ fn hit(layout: Layout, width: f64, height: f64, x: f64, y: f64, speaking: bool) 
         _ => rounded_rect(x, y, 4.0, 4.0, width - 4.0, height - 64.0, 16.0),
     }
 }
-fn clamp_origin(x: f64, y: f64, width: f64, height: f64, work: [f64; 4]) -> (f64, f64) {
-    (
-        x.clamp(work[0], (work[0] + work[2] - width).max(work[0])),
-        y.clamp(work[1], (work[1] + work[3] - height).max(work[1])),
-    )
-}
 
 pub fn show(app: &tauri::AppHandle) -> Result<(), String> {
     if let Some(window) = app.get_webview_window("compact") {
@@ -160,42 +233,52 @@ pub fn show(app: &tauri::AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn compact_set_layout(app: tauri::AppHandle, mode: Layout) -> Result<(), String> {
+pub fn compact_set_layout(app: tauri::AppHandle, mode: Layout) -> Result<Placement, String> {
     let window = app.get_webview_window("compact").ok_or("陪伴球尚未打开")?;
     let state = app.state::<Overlay>();
-    let mut layout = state.layout.lock().unwrap();
-    if *layout == mode {
-        return Ok(());
-    }
     let scale = window.scale_factor().map_err(|e| e.to_string())?;
     let old_size = window.inner_size().map_err(|e| e.to_string())?;
-    let old_pos = window.outer_position().map_err(|e| e.to_string())?;
-    let (width, height) = mode.size();
-    let mut x = old_pos.x as f64 + old_size.width as f64 - width * scale;
-    let mut y = old_pos.y as f64 + old_size.height as f64 - height * scale;
-    if let Some(monitor) = window.current_monitor().map_err(|e| e.to_string())? {
-        let area = monitor.work_area();
-        (x, y) = clamp_origin(
-            x,
-            y,
-            width * scale,
-            height * scale,
-            [
-                area.position.x as f64,
-                area.position.y as f64,
-                area.size.width as f64,
-                area.size.height as f64,
-            ],
-        );
-    }
+    let old_pos = window.inner_position().map_err(|e| e.to_string())?;
+    let previous = *state.placement.lock().unwrap();
+    let anchor = previous
+        .map(|p| {
+            (
+                old_pos.x as f64 + p.orb_x * scale,
+                old_pos.y as f64 + p.orb_y * scale,
+            )
+        })
+        .unwrap_or((
+            old_pos.x as f64 + old_size.width as f64 - 28.0 * scale,
+            old_pos.y as f64 + old_size.height as f64 - 28.0 * scale,
+        ));
+    let monitor = window
+        .current_monitor()
+        .map_err(|e| e.to_string())?
+        .ok_or("无法获取悬浮球所在屏幕")?;
+    let area = monitor.work_area();
+    let ((x, y), placement) = placement(
+        mode,
+        anchor,
+        scale,
+        [
+            area.position.x as f64,
+            area.position.y as f64,
+            area.size.width as f64,
+            area.size.height as f64,
+        ],
+    );
     window
-        .set_size(tauri::LogicalSize::new(width, height))
+        .set_size(tauri::LogicalSize::new(placement.width, placement.height))
         .map_err(|e| e.to_string())?;
     window
-        .set_position(tauri::PhysicalPosition::new(x as i32, y as i32))
+        .set_position(tauri::PhysicalPosition::new(
+            x.round() as i32,
+            y.round() as i32,
+        ))
         .map_err(|e| e.to_string())?;
-    *layout = mode;
-    Ok(())
+    *state.layout.lock().unwrap() = mode;
+    *state.placement.lock().unwrap() = Some(placement);
+    Ok(placement)
 }
 #[tauri::command]
 pub fn compact_set_interacting(app: tauri::AppHandle, active: bool) -> Result<(), String> {
@@ -392,14 +475,32 @@ mod tests {
         }
     }
     #[test]
-    fn bounds_support_negative_monitor_coordinates_and_large_panels() {
-        assert_eq!(
-            clamp_origin(-100.0, 900.0, 320.0, 440.0, [-1920.0, 0.0, 1920.0, 1080.0]),
-            (-320.0, 640.0)
-        );
-        assert_eq!(
-            clamp_origin(0.0, 0.0, 320.0, 440.0, [50.0, 40.0, 100.0, 100.0]),
-            (50.0, 40.0)
-        );
+    fn layouts_keep_orb_at_all_monitor_edges_and_scales() {
+        for scale in [1.0, 1.25, 1.5, 2.0] {
+            let work = [-1920.0 * scale, 0.0, 1920.0 * scale, 1080.0 * scale];
+            for anchor in [
+                (-1892.0 * scale, 28.0 * scale),
+                (-28.0 * scale, 28.0 * scale),
+                (-1892.0 * scale, 1052.0 * scale),
+                (-28.0 * scale, 1052.0 * scale),
+                (-960.0 * scale, 540.0 * scale),
+            ] {
+                for mode in [
+                    Layout::Orb,
+                    Layout::Tools,
+                    Layout::Chat,
+                    Layout::Translate,
+                    Layout::More,
+                    Layout::Bubble,
+                ] {
+                    let ((x, y), p) = placement(mode, anchor, scale, work);
+                    assert!((x + p.orb_x * scale - anchor.0).abs() < 0.001);
+                    assert!((y + p.orb_y * scale - anchor.1).abs() < 0.001);
+                    assert!(x >= work[0] - 0.001 && y >= work[1] - 0.001);
+                    assert!(x + p.width * scale <= work[0] + work[2] + 0.001);
+                    assert!(y + p.height * scale <= work[1] + work[3] + 0.001);
+                }
+            }
+        }
     }
 }

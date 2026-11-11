@@ -1,0 +1,139 @@
+[
+  {
+    "model": "cosyvoice-v3-flash",
+    "voice": "longanyang",
+    "emotions": [
+      "neutral",
+      "fearful",
+      "angry",
+      "sad",
+      "surprised",
+      "happy",
+      "disgusted"
+    ],
+    "scenes": [
+      "闲聊互动",
+      "新闻播报",
+      "广告促销",
+      "比赛解说",
+      "一些儿童内容解说",
+      "语音导航",
+      "脱口秀表演"
+    ],
+    "rolePrefix": "你现在说话的角色是",
+    "roles": [
+      "一个旁白"
+    ],
+    "identities": [
+      "故事机"
+    ],
+    "dialects": []
+  },
+  {
+    "model": "cosyvoice-v3-flash",
+    "voice": "longanhuan",
+    "emotions": [
+      "neutral",
+      "fearful",
+      "angry",
+      "sad",
+      "surprised",
+      "happy",
+      "disgusted"
+    ],
+    "scenes": [
+      "闲聊对话",
+      "比赛解说",
+      "深夜电台广播",
+      "剧情解说",
+      "诗歌朗诵",
+      "科普知识推广",
+      "产品推广",
+      "脱口秀表演"
+    ],
+    "rolePrefix": "你说话的角色是",
+    "roles": [
+      "温和客服"
+    ],
+    "identities": [],
+    "dialects": []
+  },
+  {
+    "model": "cosyvoice-v3-plus",
+    "voice": "longanyang",
+    "emotions": [
+      "neutral",
+      "fearful",
+      "angry",
+      "sad",
+      "surprised",
+      "happy",
+      "disgusted"
+    ],
+    "scenes": [
+      "闲聊互动",
+      "新闻播报",
+      "广告促销",
+      "比赛解说",
+      "一些儿童内容解说",
+      "语音导航",
+      "脱口秀表演"
+    ],
+    "rolePrefix": "你现在说话的角色是",
+    "roles": [
+      "一个旁白"
+    ],
+    "identities": [
+      "故事机"
+    ],
+    "dialects": []
+  },
+  {
+    "model": "cosyvoice-v3-plus",
+    "voice": "longanhuan",
+    "emotions": [
+      "neutral",
+      "fearful",
+      "angry",
+      "sad",
+      "surprised",
+      "happy",
+      "disgusted"
+    ],
+    "scenes": [
+      "闲聊对话",
+      "比赛解说",
+      "深夜电台广播",
+      "诗歌朗诵",
+      "科普知识推广",
+      "产品推广",
+      "脱口秀表演"
+    ],
+    "rolePrefix": "你说话的角色是",
+    "roles": [
+      "温和客服"
+    ],
+    "identities": [],
+    "dialects": []
+  },
+  {
+    "model": "cosyvoice-v3-flash",
+    "voice": "longanhuan_v3",
+    "emotions": [],
+    "scenes": [],
+    "rolePrefix": "",
+    "roles": [],
+    "identities": [],
+    "dialects": [
+      "普通话",
+      "广东话",
+      "东北话",
+      "河南话",
+      "湖南话",
+      "陕西话",
+      "山东话",
+      "四川话",
+      "安徽话"
+    ]
+  }
+]

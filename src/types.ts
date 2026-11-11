@@ -3,7 +3,25 @@ export interface VoiceProfile {
   instructions: string;
   speed: number;
 }
+export type TtsProvider = "openai" | "cosyvoice" | "minimax";
+export interface TtsConnection { endpoint: string }
+export interface TtsProfile {
+  model: string;
+  voice: string;
+  instructions: string;
+  speed: number;
+  pitch: number;
+  emotion: string;
+  format: string;
+  sample_rate: number;
+}
+export interface CharacterTts {
+  provider: TtsProvider;
+  profiles: Partial<Record<TtsProvider, TtsProfile>>;
+}
 export interface Settings {
+  tts_connections?: Partial<Record<TtsProvider, TtsConnection>>;
+  character_tts?: Record<string, CharacterTts>;
   base_url: string;
   conversation_model: string;
   asr_model: string;
@@ -12,6 +30,8 @@ export interface Settings {
   translation_model: string;
   translation_language: string;
   translation_auto_copy: boolean;
+  translation_style: "formal" | "casual" | "playful" | "custom";
+  translation_custom_prompt: string;
   response_format: string;
   volume: number;
   audio_input_device: string;
@@ -22,6 +42,7 @@ export interface Settings {
   character_voices?: Record<string, VoiceProfile>;
   observation_minutes: number;
   observing: boolean;
+  compact_visible: boolean;
   capture_source: string;
   watch_instruction: string;
   shortcut: string;

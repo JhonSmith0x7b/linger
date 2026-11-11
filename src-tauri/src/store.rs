@@ -26,6 +26,38 @@ pub struct Memory {
     pub expires_at: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UserProfile {
+    pub content: String,
+    pub revision: i64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IntroductionState {
+    pub introduced: bool,
+    pub asked_name: bool,
+    pub legacy_history: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReferenceVoice {
+    pub voice_id: String,
+    pub name: String,
+    pub target_model: String,
+    pub status: String,
+    pub created_at: String,
+    #[serde(default)]
+    pub in_use_by: Vec<String>,
+}
+
+pub fn reference_voice_name(name: &str) -> Result<String> {
+    let name = name.trim();
+    if name.is_empty() || name.chars().count() > 60 || name.chars().any(char::is_control) {
+        return Err("音色名称请填写 1–60 个字符，不含换行或控制字符".into());
+    }
+    Ok(name.to_owned())
+}
+
 pub struct Store {
     connection: Mutex<Connection>,
 }
@@ -46,6 +78,10 @@ impl Store {
                 id INTEGER PRIMARY KEY AUTOINCREMENT, content TEXT NOT NULL,
                 updated_at TEXT NOT NULL, source TEXT NOT NULL DEFAULT 'explicit',
                 source_through INTEGER, deleted INTEGER NOT NULL DEFAULT 0);
+            CREATE TABLE IF NOT EXISTS reference_voices (
+                endpoint TEXT NOT NULL, voice_id TEXT NOT NULL, name TEXT NOT NULL,
+                target_model TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL,
+                deleted INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(endpoint,voice_id));
             CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             INSERT OR IGNORE INTO metadata (key,value) VALUES ('memory_revision','0');
         ",
@@ -90,6 +126,19 @@ impl Store {
         let mut stmt = conn.prepare("SELECT id,role,content,created_at FROM (SELECT * FROM messages ORDER BY id DESC LIMIT 200) ORDER BY id").map_err(db_error)?;
         let rows = stmt
             .query_map([], message_row)
+            .map_err(db_error)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(db_error)?;
+        Ok(rows)
+    }
+    /// Read one chronological UI page; the model context keeps its independent history budget.
+    pub fn message_page(&self, before_id: Option<i64>, limit: usize) -> Result<Vec<Message>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT id,role,content,created_at FROM (SELECT id,role,content,created_at FROM messages WHERE (?1 IS NULL OR id<?1) ORDER BY id DESC LIMIT ?2) ORDER BY id"
+        ).map_err(db_error)?;
+        let rows = stmt
+            .query_map(params![before_id, limit.clamp(1, 100) as i64], message_row)
             .map_err(db_error)?
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(db_error)?;
@@ -141,6 +190,51 @@ impl Store {
             created_at: timestamp,
         })
     }
+    pub fn introduction_state(&self) -> Result<IntroductionState> {
+        let conn = self.lock()?;
+        let state = read_introduction(&conn)?;
+        // Initialize once, before any new turn. Existing chats are not assumed
+        // to be strangers merely because this feature was just installed.
+        conn.execute(
+            "INSERT OR IGNORE INTO metadata(key,value) VALUES ('introduction_state',?1)",
+            [serde_json::to_string(&state).map_err(|e| e.to_string())?],
+        )
+        .map_err(db_error)?;
+        Ok(state)
+    }
+
+    pub fn add_companion_message(
+        &self,
+        role: &str,
+        content: &str,
+        introduced: bool,
+        asked_name: bool,
+    ) -> Result<Message> {
+        if !["assistant", "proactive"].contains(&role) || content.trim().is_empty() {
+            return Err("角色回复不能为空，且必须为助手或主动陪伴消息".into());
+        }
+        let mut conn = self.lock()?;
+        let tx = conn.transaction().map_err(db_error)?;
+        let mut state = read_introduction(&tx)?;
+        state.introduced |= introduced;
+        state.asked_name |= asked_name;
+        let timestamp = Utc::now().to_rfc3339();
+        tx.execute(
+            "INSERT INTO messages(role,content,created_at) VALUES (?1,?2,?3)",
+            params![role, content, timestamp],
+        )
+        .map_err(db_error)?;
+        let message = Message {
+            id: tx.last_insert_rowid(),
+            role: role.into(),
+            content: content.into(),
+            created_at: timestamp,
+        };
+        tx.execute("INSERT INTO metadata(key,value) VALUES ('introduction_state',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [serde_json::to_string(&state).map_err(|e| e.to_string())?]).map_err(db_error)?;
+        tx.commit().map_err(db_error)?;
+        Ok(message)
+    }
+
     pub fn memories(&self) -> Result<Vec<Memory>> {
         self.expire_memories()?;
         let conn = self.lock()?;
@@ -282,6 +376,187 @@ impl Store {
         self.lock()?.execute("INSERT INTO metadata(key,value) VALUES (?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",params![key,value]).map_err(db_error)?;
         Ok(())
     }
+    pub fn list_reference_voices(&self, endpoint: &str) -> Result<Vec<ReferenceVoice>> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction().map_err(db_error)?;
+        // Migrate the old per-model latest-only records without overwriting names or reviving deleted voices.
+        let prefix = format!("reference_voice:{endpoint}:");
+        let legacy = {
+            let mut stmt = tx
+                .prepare("SELECT value FROM metadata WHERE substr(key,1,?1)=?2")
+                .map_err(db_error)?;
+            let rows = stmt
+                .query_map(params![prefix.chars().count(), prefix], |r| {
+                    r.get::<_, String>(0)
+                })
+                .map_err(db_error)?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(db_error)?;
+            rows
+        };
+        for encoded in legacy {
+            let Ok(value) = serde_json::from_str::<Value>(&encoded) else {
+                continue;
+            };
+            let (Some(id), Some(model)) =
+                (value["voice_id"].as_str(), value["target_model"].as_str())
+            else {
+                continue;
+            };
+            if crate::voice_clone::model_for_voice(&format!("{model}-migration")).as_deref()
+                != Some(model)
+                || !id.starts_with("cosyvoice-")
+                || id.len() > 256
+                || !id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+            {
+                continue;
+            }
+            let name = value["name"]
+                .as_str()
+                .and_then(|n| reference_voice_name(n).ok())
+                .unwrap_or_else(|| {
+                    format!(
+                        "参考音色 · {}",
+                        id.chars()
+                            .rev()
+                            .take(6)
+                            .collect::<String>()
+                            .chars()
+                            .rev()
+                            .collect::<String>()
+                    )
+                });
+            tx.execute("INSERT OR IGNORE INTO reference_voices(endpoint,voice_id,name,target_model,status,created_at) VALUES (?1,?2,?3,?4,?5,?6)",
+                params![endpoint,id,name,model,"UNKNOWN",Utc::now().to_rfc3339()]).map_err(db_error)?;
+        }
+        tx.commit().map_err(db_error)?;
+        let mut stmt = conn.prepare("SELECT voice_id,name,target_model,status,created_at FROM reference_voices WHERE endpoint=?1 AND deleted=0 ORDER BY created_at DESC,voice_id").map_err(db_error)?;
+        let rows = stmt
+            .query_map([endpoint], |r| {
+                Ok(ReferenceVoice {
+                    voice_id: r.get(0)?,
+                    name: r.get(1)?,
+                    target_model: r.get(2)?,
+                    status: r.get(3)?,
+                    created_at: r.get(4)?,
+                    in_use_by: Vec::new(),
+                })
+            })
+            .map_err(db_error)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(db_error)?;
+        Ok(rows)
+    }
+    pub fn upsert_reference_voice(&self, endpoint: &str, voice: &ReferenceVoice) -> Result<()> {
+        let name = reference_voice_name(&voice.name)?;
+        self.lock()?.execute("INSERT INTO reference_voices(endpoint,voice_id,name,target_model,status,created_at) VALUES (?1,?2,?3,?4,?5,?6)
+            ON CONFLICT(endpoint,voice_id) DO UPDATE SET target_model=excluded.target_model,status=excluded.status WHERE reference_voices.deleted=0",
+            params![endpoint,voice.voice_id,name,voice.target_model,voice.status,voice.created_at]).map_err(db_error)?;
+        Ok(())
+    }
+    pub fn rename_reference_voice(&self, endpoint: &str, voice_id: &str, name: &str) -> Result<()> {
+        let name = reference_voice_name(name)?;
+        let changed = self.lock()?.execute("UPDATE reference_voices SET name=?3 WHERE endpoint=?1 AND voice_id=?2 AND deleted=0",params![endpoint,voice_id,name]).map_err(db_error)?;
+        if changed == 0 {
+            return Err("此音色不在当前连接的音色库中，请刷新列表".into());
+        }
+        Ok(())
+    }
+    pub fn delete_reference_voice(&self, endpoint: &str, voice_id: &str) -> Result<()> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction().map_err(db_error)?;
+        // Retain a tombstone so stale cloud pages or drafts cannot resurrect a deleted voice.
+        tx.execute(
+            "UPDATE reference_voices SET deleted=1 WHERE endpoint=?1 AND voice_id=?2",
+            params![endpoint, voice_id],
+        )
+        .map_err(db_error)?;
+        let prefix = format!("reference_voice:{endpoint}:");
+        let legacy = {
+            let mut stmt = tx
+                .prepare("SELECT key,value FROM metadata WHERE substr(key,1,?1)=?2")
+                .map_err(db_error)?;
+            let rows = stmt
+                .query_map(params![prefix.chars().count(), prefix], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })
+                .map_err(db_error)?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(db_error)?;
+            rows
+        };
+        for (key, encoded) in legacy {
+            if serde_json::from_str::<Value>(&encoded)
+                .is_ok_and(|v| v["voice_id"].as_str() == Some(voice_id))
+            {
+                tx.execute("DELETE FROM metadata WHERE key=?1", [key])
+                    .map_err(db_error)?;
+            }
+        }
+        tx.commit().map_err(db_error)
+    }
+    pub fn reference_voice_deleted(&self, _endpoint: &str, voice_id: &str) -> Result<bool> {
+        self.lock()?
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM reference_voices WHERE voice_id=?1 AND deleted=1)",
+                [voice_id],
+                |r| r.get::<_, bool>(0),
+            )
+            .map_err(db_error)
+    }
+    pub fn user_profile(&self) -> Result<UserProfile> {
+        let conn = self.lock()?;
+        read_user_profile(&conn)
+    }
+    pub fn save_user_profile(&self, content: &str, expected_revision: i64) -> Result<UserProfile> {
+        let content = content.trim();
+        if content.chars().count() > 2000
+            || tiktoken_rs::o200k_base_singleton()
+                .encode_ordinary(content)
+                .len()
+                > 1000
+        {
+            return Err("用户档案最多 2000 字符、1000 token，请精简后保存".into());
+        }
+        let mut conn = self.lock()?;
+        let tx = conn.transaction().map_err(db_error)?;
+        let current = read_user_profile(&tx)?;
+        if current.revision != expected_revision {
+            return Err("用户档案已被其他窗口或 AI 更新，请重新载入后再修改".into());
+        }
+        let profile = UserProfile {
+            content: content.to_owned(),
+            revision: current.revision + 1,
+        };
+        tx.execute("INSERT INTO metadata(key,value) VALUES ('user_profile',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [&profile.content]).map_err(db_error)?;
+        tx.execute("INSERT INTO metadata(key,value) VALUES ('user_profile_revision',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [profile.revision.to_string()]).map_err(db_error)?;
+        // Do not hide chat history when editing the profile. Invalidate only old
+        // derived summaries/extractions; the current profile supersedes past preferences.
+        tx.execute(
+            "UPDATE metadata SET value=CAST(value AS INTEGER)+1 WHERE key='memory_revision'",
+            [],
+        )
+        .map_err(db_error)?;
+        tx.execute("DELETE FROM metadata WHERE key='summary'", [])
+            .map_err(db_error)?;
+        tx.commit().map_err(db_error)?;
+        Ok(profile)
+    }
+    pub fn clear_conversation(&self) -> Result<()> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction().map_err(db_error)?;
+        tx.execute("DELETE FROM messages", []).map_err(db_error)?;
+        tx.execute("DELETE FROM metadata WHERE key IN ('summary','processed_through','organized_at','last_organized_at','memory_history_floor','introduction_state')", []).map_err(db_error)?;
+        tx.execute(
+            "UPDATE metadata SET value=CAST(value AS INTEGER)+1 WHERE key='memory_revision'",
+            [],
+        )
+        .map_err(db_error)?;
+        // Preserve sqlite_sequence: a later message must not reuse an old ID.
+        tx.commit().map_err(db_error)
+    }
     pub fn memory_revision(&self) -> Result<i64> {
         Ok(self
             .get_meta("memory_revision")?
@@ -330,6 +605,53 @@ impl Store {
         Ok(true)
     }
 }
+fn read_introduction(conn: &Connection) -> Result<IntroductionState> {
+    let stored: Option<String> = conn
+        .query_row(
+            "SELECT value FROM metadata WHERE key='introduction_state'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(db_error)?;
+    if let Some(stored) = stored {
+        return serde_json::from_str(&stored).map_err(|_| "相识状态格式无效".into());
+    }
+    let legacy_history = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM messages WHERE role IN ('assistant','proactive'))",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(db_error)?;
+    Ok(IntroductionState {
+        legacy_history,
+        ..Default::default()
+    })
+}
+
+fn read_user_profile(conn: &Connection) -> Result<UserProfile> {
+    let content = conn
+        .query_row(
+            "SELECT value FROM metadata WHERE key='user_profile'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(db_error)?
+        .unwrap_or_default();
+    let revision = conn
+        .query_row(
+            "SELECT CAST(value AS INTEGER) FROM metadata WHERE key='user_profile_revision'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(db_error)?
+        .unwrap_or(0);
+    Ok(UserProfile { content, revision })
+}
+
 fn scope_expiration(scope: &str) -> Result<Option<String>> {
     match scope {
         "long_term" | "session" => Ok(None),
@@ -403,6 +725,212 @@ mod tests {
         Store::open(Path::new(":memory:")).unwrap()
     }
     #[test]
+    fn introductions_commit_with_message_and_reset_only_with_conversation() {
+        let db = store();
+        assert_eq!(
+            db.introduction_state().unwrap(),
+            IntroductionState::default()
+        );
+        assert!(db
+            .add_companion_message("assistant", " ", true, true)
+            .is_err());
+        assert_eq!(
+            db.introduction_state().unwrap(),
+            IntroductionState::default()
+        );
+        // A concrete first request can complete without introducing the character.
+        db.add_companion_message("assistant", "这是问题的答案。", false, false)
+            .unwrap();
+        assert_eq!(
+            db.introduction_state().unwrap(),
+            IntroductionState::default()
+        );
+        db.add_companion_message("proactive", "我是凛，怎么称呼你？", true, true)
+            .unwrap();
+        let state = db.introduction_state().unwrap();
+        assert!(state.introduced && state.asked_name && !state.legacy_history);
+        db.add_companion_message("assistant", "继续聊", false, false)
+            .unwrap();
+        db.save_user_profile("", 0).unwrap();
+        assert_eq!(db.introduction_state().unwrap(), state);
+        db.clear_conversation().unwrap();
+        assert_eq!(
+            db.introduction_state().unwrap(),
+            IntroductionState::default()
+        );
+    }
+
+    #[test]
+    fn failed_introduction_transaction_cannot_save_message_or_flags() {
+        let db = store();
+        db.introduction_state().unwrap();
+        db.lock().unwrap().execute_batch("CREATE TRIGGER reject_intro BEFORE UPDATE ON metadata WHEN NEW.key='introduction_state' BEGIN SELECT RAISE(ABORT, 'test rejection'); END;").unwrap();
+        assert!(db
+            .add_companion_message("assistant", "我是凛", true, false)
+            .is_err());
+        assert!(db.messages().unwrap().is_empty());
+        assert_eq!(
+            db.introduction_state().unwrap(),
+            IntroductionState::default()
+        );
+    }
+
+    #[test]
+    fn upgrading_old_chat_does_not_force_a_new_introduction() {
+        let db = store();
+        db.add_message("assistant", "以前的聊天").unwrap();
+        let state = db.introduction_state().unwrap();
+        assert!(state.legacy_history);
+        assert!(!state.introduced && !state.asked_name);
+        assert_eq!(db.introduction_state().unwrap(), state);
+    }
+
+    #[test]
+    fn profile_edits_are_bounded_and_reject_stale_replacements() {
+        let db = store();
+        assert_eq!(
+            db.user_profile().unwrap(),
+            UserProfile {
+                content: String::new(),
+                revision: 0
+            }
+        );
+        let saved = db
+            .save_user_profile("# 交流偏好\n喜欢自然的角色陪伴", 0)
+            .unwrap();
+        assert_eq!(saved.revision, 1);
+        assert!(db.save_user_profile("过期窗口覆盖", 0).is_err());
+        assert_eq!(db.user_profile().unwrap(), saved);
+        assert!(db.save_user_profile(&"字".repeat(2001), 1).is_err());
+        assert!(db.save_user_profile(&"🙂".repeat(1001), 1).is_err());
+        assert_eq!(db.save_user_profile("", 1).unwrap().content, "");
+    }
+
+    #[test]
+    fn clearing_conversation_preserves_identity_and_blocks_stale_extraction() {
+        let db = store();
+        db.save_settings(&serde_json::json!({"personality":"凛"}))
+            .unwrap();
+        db.add_memory("喜欢主动聊天").unwrap();
+        let profile = db.save_user_profile("# 偏好\n保持角色身份", 0).unwrap();
+        let old = db.add_message("user", "旧话题").unwrap();
+        let revision = db.memory_revision().unwrap();
+        db.set_meta("summary", "旧摘要").unwrap();
+        db.set_meta("processed_through", &old.id.to_string())
+            .unwrap();
+        db.clear_conversation().unwrap();
+        assert!(db.messages().unwrap().is_empty());
+        assert!(db.search_messages("旧", 5).unwrap().is_empty());
+        assert!(db.get_meta("summary").unwrap().is_none());
+        assert!(db.get_meta("processed_through").unwrap().is_none());
+        assert_eq!(db.user_profile().unwrap(), profile);
+        assert_eq!(db.memories().unwrap().len(), 1);
+        assert_eq!(db.load_settings().unwrap().unwrap()["personality"], "凛");
+        assert!(!db
+            .apply_memory_batch(revision, &["旧事实".into()], "旧摘要复活", old.id)
+            .unwrap());
+        assert!(db.add_message("user", "新话题").unwrap().id > old.id);
+    }
+
+    #[test]
+    fn voice_library_keeps_multiple_named_voices_and_cloud_refresh_preserves_names() {
+        let db = store();
+        let endpoint = "https://example.com/api/v1/services/audio/tts/SpeechSynthesizer";
+        let mut voice = ReferenceVoice {
+            voice_id: "cosyvoice-v3-flash-linger-one".into(),
+            name: "温柔的声音".into(),
+            target_model: "cosyvoice-v3-flash".into(),
+            status: "DEPLOYING".into(),
+            created_at: "2026-11-11T00:00:00Z".into(),
+            in_use_by: Vec::new(),
+        };
+        db.upsert_reference_voice(endpoint, &voice).unwrap();
+        voice.voice_id = "cosyvoice-v3-flash-linger-two".into();
+        voice.name = "第二个声音".into();
+        db.upsert_reference_voice(endpoint, &voice).unwrap();
+        db.rename_reference_voice(endpoint, &voice.voice_id, "中文自定义名称")
+            .unwrap();
+        voice.status = "OK".into();
+        voice.name = "云端默认名称".into();
+        db.upsert_reference_voice(endpoint, &voice).unwrap();
+        let rows = db.list_reference_voices(endpoint).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows.iter()
+                .find(|v| v.voice_id == voice.voice_id)
+                .unwrap()
+                .name,
+            "中文自定义名称"
+        );
+        assert_eq!(
+            rows.iter()
+                .find(|v| v.voice_id == voice.voice_id)
+                .unwrap()
+                .status,
+            "OK"
+        );
+        assert!(db
+            .list_reference_voices("another endpoint")
+            .unwrap()
+            .is_empty());
+        assert!(db
+            .rename_reference_voice(endpoint, &voice.voice_id, "")
+            .is_err());
+        assert!(db
+            .rename_reference_voice(endpoint, &voice.voice_id, &"字".repeat(61))
+            .is_err());
+    }
+    #[test]
+    fn legacy_voice_migration_and_delete_tombstone_prevent_resurrection() {
+        let db = store();
+        let endpoint = "https://example.com/tts";
+        let id = "cosyvoice-v3-flash-linger-old";
+        let meta_key = format!("reference_voice:{endpoint}:cosyvoice-v3-flash");
+        db.set_meta(
+            &meta_key,
+            &serde_json::json!({"voice_id":id,"target_model":"cosyvoice-v3-flash"}).to_string(),
+        )
+        .unwrap();
+        let rows = db.list_reference_voices(endpoint).unwrap();
+        assert_eq!(rows.len(), 1);
+        db.rename_reference_voice(endpoint, id, "迁移后的名字")
+            .unwrap();
+        assert_eq!(
+            db.list_reference_voices(endpoint).unwrap()[0].name,
+            "迁移后的名字"
+        );
+        db.delete_reference_voice(endpoint, id).unwrap();
+        assert!(db.get_meta(&meta_key).unwrap().is_none());
+        assert!(db.list_reference_voices(endpoint).unwrap().is_empty());
+        assert!(db.reference_voice_deleted(endpoint, id).unwrap());
+        assert!(db
+            .reference_voice_deleted("https://another-account-alias/tts", id)
+            .unwrap());
+        db.upsert_reference_voice(endpoint, &rows[0]).unwrap();
+        assert!(db.list_reference_voices(endpoint).unwrap().is_empty());
+    }
+
+    #[test]
+    fn history_pages_are_bounded_ordered_and_do_not_overlap() {
+        let db = store();
+        for index in 0..125 {
+            db.add_message("user", &format!("message {index}")).unwrap();
+        }
+        let latest = db.message_page(None, 50).unwrap();
+        assert_eq!(latest.len(), 50);
+        assert_eq!((latest[0].id, latest[49].id), (76, 125));
+        db.add_message("assistant", "new live reply").unwrap();
+        let older = db.message_page(Some(latest[0].id), 50).unwrap();
+        assert_eq!((older[0].id, older[49].id), (26, 75));
+        let first = db.message_page(Some(older[0].id), 50).unwrap();
+        assert_eq!(first.len(), 25);
+        assert_eq!((first[0].id, first[24].id), (1, 25));
+        assert!(db.message_page(Some(1), 50).unwrap().is_empty());
+        assert_eq!(db.message_page(None, usize::MAX).unwrap().len(), 100);
+        assert_eq!(db.message_page(None, 0).unwrap().len(), 1);
+        assert_eq!(db.messages().unwrap().len(), 126);
+    }
+    #[test]
     fn history_search_supports_short_chinese_and_literal_wildcards() {
         let db = store();
         db.add_message("user", "请重点看左边 100% 的进度").unwrap();
@@ -450,6 +978,7 @@ mod tests {
         ));
         {
             let db = Store::open(&path).unwrap();
+            db.save_user_profile("喜欢自然陪伴", 0).unwrap();
             db.add_message("user", "记住我喜欢安静").unwrap();
             db.add_memory("喜欢安静").unwrap();
             db.save_settings(&serde_json::json!({"voice":"coral"}))
@@ -457,6 +986,13 @@ mod tests {
         }
         {
             let db = Store::open(&path).unwrap();
+            assert_eq!(
+                db.user_profile().unwrap(),
+                UserProfile {
+                    content: "喜欢自然陪伴".into(),
+                    revision: 1
+                }
+            );
             assert_eq!(db.messages().unwrap()[0].content, "记住我喜欢安静");
             assert_eq!(db.memories().unwrap()[0].content, "喜欢安静");
             assert_eq!(db.load_settings().unwrap().unwrap()["voice"], "coral");

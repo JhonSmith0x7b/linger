@@ -1,15 +1,11 @@
-# 角色卡插画
+# 角色卡设定与插画
 
-使用内置 image_gen 工具生成；没有调用项目内的 API Key。原始 PNG 复制到 `public/characters/`，随应用打包。插画是角色选择与头像素材，不是 Live2D／3D 虚拟形象。角色行为由可编辑的人格文本决定。
+当前角色：凉宫春日、雪之下雪乃、峰不二子。三张 PNG 由内置 image_gen 工具生成并复制到 `public/characters/`，不是官方截图；未使用项目 API Key。用于角色选择与头像，不发送给聊天模型。
 
-## 栞 — shiori.png
+人格与卡片展示共用 `src/character-presets.json`。以下官方资料用于核对角色特征；具体陪伴提示词、互动示例和卡面是本项目的创作适配，不是原作台词或官方角色卡。
 
-Use case: stylized-concept. Asset type: anime character portrait illustration for a quiet desktop AI companion's selectable persona card. Create ONE original adult woman in her mid twenties named Shiori (no text in image). Medium-length chestnut hair, soft sage green eyes, simple cream cardigan with sage detail, holding a closed book loosely. Calm attentive expression with a tiny knowing smile: outwardly quiet and gentle, subtly independent-minded and observant. Contemporary refined Japanese anime illustration, delicate clean line art, painterly soft shading, warm natural light. Bust portrait, face near upper center, plenty of space around hair, square composition easy to crop to a tall card or round avatar. Muted sage and cream reading-room background, unobtrusive. Fully clothed, no school uniform, no sexualization. No lettering, no logo, no border, no watermark. One character only.
+- [凉宫春日官方角色介绍](https://haruhitv-anniversary.com/chara.html)：以有趣与否判断事情，任性而有行动力。对应 `haruhi.png`，黄色发带、棕色短发、蓝白制服、明亮琥珀背景，自信好奇的表情。
+- [雪之下雪乃官方角色介绍](https://www.tbs.co.jp/anime/oregairu/character/chara02.html)：奉仕部部长，不随意迎合，直指事物本质。对应 `yukino.png`，黑色长发、红色发饰、黑色制服外套、书本与冰蓝背景，冷静克制。
+- [峰不二子官方角色介绍](https://lupin-3rd.net/fujiko-mine/character.html)：神秘、机敏，擅长话术。对应 `fujiko.png`，成年形象、赤褐长发、黑色服装、金色耳饰、墨绿装饰艺术背景，自信狡黠。
 
-## 小晴 — koharu.png
-
-Use case: stylized-concept. Asset type: anime portrait for a selectable desktop companion persona card. Create ONE original adult woman in her mid twenties, Koharu (no text). Short apricot-copper hair with a small simple hair clip, amber eyes, relaxed peach sweater over a white top. Bright slightly mischievous smile and lively attentive gaze; expressive but not exaggerated. Outwardly sunny and playful, inwardly considerate and perceptive. Soft afternoon light with muted peach-and-cream studio backdrop, a leafy plant and blurred hobby shelf. Contemporary refined Japanese anime illustration, delicate clean line art, painterly soft shading, polished consistent visual novel art direction. Bust portrait, face near upper center, square composition easy to crop to tall card and round avatar. Plenty of breathing room around the hair. Fully clothed, no school uniform, no sexualization, no extra people, no text, no logo, no watermark, no frame.
-
-## 凛 — rin.png
-
-Use case: stylized-concept. Asset type: anime portrait for a selectable desktop companion persona card. Create ONE original adult woman in her mid twenties, Rin (no text). Straight dark midnight-blue hair to her shoulders, cool gray-blue eyes, navy cardigan over a modest pale gray turtleneck. Reserved thoughtful gaze with a barely visible affectionate half-smile, holding a warm ceramic mug. Outwardly composed and analytical, inwardly quietly caring. Blue-hour desk-side backdrop, soft muted navy/lavender and warm amber lamplight, quiet and welcoming rather than cold. Contemporary refined Japanese anime illustration, delicate clean line art, painterly soft shading, polished consistent visual novel art direction. Bust portrait, face near upper center, square composition easy to crop to tall card and round avatar. Plenty of breathing room around the hair. Fully clothed, no school uniform, no sexualization, no extra people, no text, no logo, no watermark, no frame.
+画面采用协调的日式动画线稿与平涂风格，无文字、标识或水印。所有生成原图保留在生成工具目录，项目内存放实际打包版本。旧三张原创角色图片已从项目移除，旧角色配置仅保留为兼容数据，不再出现在选择界面。

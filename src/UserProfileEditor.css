@@ -1,0 +1,13 @@
+.user-profile-editor { margin: 0 0 24px; padding: 22px; border: 1px solid var(--border, #e1e5dc); border-radius: 16px; background: var(--surface, #fff); }
+.user-profile-heading { display: flex; gap: 16px; align-items: flex-start; justify-content: space-between; margin-bottom: 16px; }
+.user-profile-heading h2 { margin: 0 0 6px; font-size: 18px; }
+.user-profile-heading p, .user-profile-help { margin: 0; color: var(--text-muted, #72796d); font-size: 12px; line-height: 1.7; }
+.user-profile-heading button { flex-shrink: 0; }
+.user-profile-editor form > label { display: block; font-size: 13px; margin-bottom: 8px; }
+.user-profile-editor textarea { width: 100%; min-height: 180px; resize: vertical; box-sizing: border-box; line-height: 1.7; margin-bottom: 8px; }
+.user-profile-actions { display: flex; gap: 12px; align-items: center; justify-content: space-between; margin-top: 14px; }
+.user-profile-actions small { color: var(--text-muted, #72796d); }
+.user-profile-error, .user-profile-actions .user-profile-error { color: #ad453f; font-size: 12px; }
+.user-profile-notice { color: #45684e; font-size: 12px; }
+.user-profile-conflict { margin-top: 12px; padding: 12px; border: 1px solid #ddc88d; border-radius: 10px; background: #fff9e8; font-size: 12px; line-height: 1.7; }
+.user-profile-conflict p { margin: 0 0 8px; }

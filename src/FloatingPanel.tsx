@@ -1,3 +1,4 @@
+import { translationStyles } from "./translationStyles";
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { CSSProperties, PointerEvent, ReactNode } from "react";
 import { invoke, isTauri } from "@tauri-apps/api/core";
@@ -5,6 +6,8 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { MarkdownText } from "./MarkdownText";
 import type { Message, Settings, Status } from "./types";
+
+type Placement = { width: number; height: number; orb_x: number; orb_y: number; panel_x: number; panel_y: number; panel_width: number; panel_height: number; controls_left: boolean };
 
 type Mode = "orb" | "tools" | "chat" | "translate" | "more" | "bubble";
 const phaseNames: Record<string, string> = { idle: "在这里陪你", recording: "正在听 · 再点麦克风发送", transcribing: "正在识别语音", thinking: "正在想一想", generating: "正在回应", observing: "看看你的屏幕", playing: "正在说话", speaking: "正在说话", synthesizing: "准备说给你听", stopped: "已停止", error: "有件事需要留意", tool: "正在使用工具" };
@@ -14,6 +17,7 @@ export function FloatingPanel({ settings, messages, streamText, ready, status, e
   onSetTranslationAutoCopy: (enabled: boolean) => Promise<void>; onStartRecording: () => void; onStopRecording: () => void; onToggleObserving: () => void; sourceControls: ReactNode; observationBusy: boolean;
 }) {
   const [mode, setMode] = useState<Mode>("orb");
+  const [placement, setPlacement] = useState<Placement | null>(null);
   const layer = useRef<HTMLDivElement>(null);
   const modeRef = useRef<Mode>("orb");
   const [bubble, setBubble] = useState("");
@@ -21,6 +25,7 @@ export function FloatingPanel({ settings, messages, streamText, ready, status, e
   const [observingPulse, setObservingPulse] = useState(false);
   const observeTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const [text, setText] = useState("");
+  const [translationStyle, setTranslationStyle] = useState(settings.translation_style);
   const [chatText, setChatText] = useState("");
   const [sending, setSending] = useState(false);
   const chatInput = useRef<HTMLTextAreaElement>(null);
@@ -44,6 +49,7 @@ export function FloatingPanel({ settings, messages, streamText, ready, status, e
   const [autoCopySaving, setAutoCopySaving] = useState(false);
   const layoutQueue = useRef(Promise.resolve());
   const press = useRef<{ x: number; y: number; dragging: boolean } | null>(null);
+  const suppressDragHover = useRef(false);
   const previousMessage = useRef<number | undefined>(undefined);
   const startRef = useRef(onStartRecording); startRef.current = onStartRecording;
   const stopRef = useRef(onStopRecording); stopRef.current = onStopRecording;
@@ -66,7 +72,10 @@ export function FloatingPanel({ settings, messages, streamText, ready, status, e
     layoutQueue.current = layoutQueue.current.catch(() => {}).then(async () => {
       // Skip queued intermediate hover layouts when a card has already been opened.
       if (modeRef.current !== next) return;
-      if (isTauri()) await invoke("compact_set_layout", { mode: next });
+      if (isTauri()) {
+        const nextPlacement = await invoke<Placement>("compact_set_layout", { mode: next });
+        if (modeRef.current === next && nextPlacement) setPlacement(nextPlacement);
+      }
     }).catch(() => setError("悬浮界面尺寸调整失败，请重新打开悬浮球。"));
   }, []);
   useEffect(() => {
@@ -104,10 +113,10 @@ export function FloatingPanel({ settings, messages, streamText, ready, status, e
     publishRegions();
     void layoutQueue.current.then(publishRegions);
     return () => { disposed = true; observer.disconnect(); window.removeEventListener("resize", publishRegions); cancelAnimationFrame(frame); };
-  }, [mode, speaking]);
+  }, [mode, speaking, placement]);
   const showBubble = useCallback((message: string) => {
     setBubble(message);
-    if (["orb", "tools", "bubble"].includes(modeRef.current) && !press.current && !voiceActive.current) {
+    if (["orb", "bubble"].includes(modeRef.current) && !press.current && !suppressDragHover.current && !voiceActive.current) {
       changeMode("bubble");
       hideTimer.current = setTimeout(() => changeMode("orb"), 8000);
     }
@@ -129,7 +138,7 @@ export function FloatingPanel({ settings, messages, streamText, ready, status, e
     let disposed = false;
     let cleanup: (() => void) | undefined;
     if (isTauri()) void listen<{ orb: boolean; inside: boolean }>("linger:overlay-hover", ({ payload }) => {
-      if (press.current) return;
+      if (press.current || suppressDragHover.current) return;
       if (payload.orb && modeRef.current === "orb") changeMode("tools");
       if (modeRef.current === "tools") {
         clearTimeout(hideTimer.current);
@@ -159,18 +168,19 @@ export function FloatingPanel({ settings, messages, streamText, ready, status, e
     if (previousMessage.current === undefined) { previousMessage.current = last?.id ?? 0; return; }
     if (last && last.id > previousMessage.current) {
       previousMessage.current = last.id;
-      if (last.role !== "user") showBubble(last.content);
+      showBubble(last.role === "user" ? `你：${last.content}` : last.content);
     }
   }, [messages, ready, showBubble]);
   useEffect(() => {
     request.current += 1; inFlight.current = false; setPending(false); setResult(""); setError(""); setCopied(false);
-  }, [settings.translation_model, settings.translation_language]);
+  }, [settings.translation_model, settings.translation_language, settings.translation_custom_prompt, translationStyle]);
+  useEffect(() => { setTranslationStyle(settings.translation_style); }, [settings.translation_style]);
   useEffect(() => () => {
     request.current += 1; clearTimeout(hideTimer.current); clearTimeout(observeTimer.current);
     if (voiceActive.current) stopRef.current();
     if (isTauri()) void invoke("compact_set_interacting", { active: false });
   }, []);
-  useEffect(() => { if (mode === "chat") bottom.current?.scrollIntoView({ block: "end" }); }, [messages, streamText, mode]);
+  useEffect(() => { if (mode === "chat" || mode === "tools") bottom.current?.scrollIntoView({ block: "end" }); }, [messages, streamText, mode]);
   useEffect(() => {
     const escape = (event: KeyboardEvent) => { if (event.key === "Escape") { endPress(false); stopRef.current(); changeMode("orb"); } };
     window.addEventListener("keydown", escape);
@@ -212,7 +222,7 @@ export function FloatingPanel({ settings, messages, streamText, ready, status, e
     const display = displayRevision.current;
     setPending(true); setError(""); setResult(""); setCopied(false);
     try {
-      const translated = await invoke<string>("translate_text", { text: text.trim() });
+      const translated = await invoke<string>("translate_text", { text: text.trim(), style: translationStyle });
       if (id !== request.current) return;
       if (display === displayRevision.current) setResult(translated);
       if (copyOnComplete && autoCopy.current && translated.trim()) {
@@ -241,19 +251,38 @@ export function FloatingPanel({ settings, messages, streamText, ready, status, e
       else changeMode("chat");
     }
   }
+
   function beginPress(event: PointerEvent<HTMLButtonElement>) {
     if (event.button !== 0 || !ready) return;
     event.preventDefault(); event.currentTarget.setPointerCapture(event.pointerId);
     clearTimeout(hideTimer.current);
+    suppressDragHover.current = false;
     press.current = { x: event.screenX, y: event.screenY, dragging: false };
     void command("compact_set_interacting", { active: true });
   }
+  function hoverOrb(event: PointerEvent<HTMLButtonElement>) {
+    clearTimeout(hideTimer.current);
+    // Native drag commands may return before the mouse is released. Only a real,
+    // unpressed pointer event may re-enable hover; native hover notifications cannot.
+    if (press.current || event.buttons !== 0) return;
+    suppressDragHover.current = false;
+    if (["orb", "bubble"].includes(modeRef.current)) changeMode("tools");
+  }
   function movePress(event: PointerEvent<HTMLButtonElement>) {
     const active = press.current;
+    if (!active && suppressDragHover.current && event.buttons === 0) { hoverOrb(event); return; }
     if (!active || active.dragging || Math.hypot(event.screenX - active.x, event.screenY - active.y) < 6) return;
-    active.dragging = true;
+    active.dragging = true; suppressDragHover.current = true;
+    changeMode("orb");
     if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
-    void command("compact_drag").finally(() => { press.current = null; void command("compact_set_interacting", { active: false }); });
+    // Resize the actual native window before handing movement to the OS, otherwise
+    // the invisible expanded panel still prevents the orb reaching the screen edge.
+    void layoutQueue.current.then(async () => {
+      if (press.current === active) await command("compact_drag");
+    }).finally(() => {
+      if (press.current === active) press.current = null;
+      void command("compact_set_interacting", { active: false });
+    });
   }
   function leave() {
     if (modeRef.current === "tools" && !press.current && !voiceActive.current) hideTimer.current = setTimeout(() => changeMode("orb"), 650);
@@ -268,13 +297,20 @@ export function FloatingPanel({ settings, messages, streamText, ready, status, e
       startRef.current();
     }
   }
-  const card = ["chat", "translate", "more"].includes(mode);
-  return <div ref={layer} className={`companion-layer mode-${mode}`} onPointerEnter={() => { if (modeRef.current === "tools") clearTimeout(hideTimer.current); }} onPointerLeave={leave}>
+  const card = ["tools", "chat", "translate", "more"].includes(mode);
+  const positionStyle = placement ? {
+    "--orb-x": `${placement.orb_x}px`, "--orb-y": `${placement.orb_y}px`,
+    "--panel-x": `${placement.panel_x}px`, "--panel-y": `${placement.panel_y}px`,
+    "--panel-width": `${placement.panel_width}px`, "--panel-height": `${placement.panel_height}px`,
+    "--translate-x": `${placement.orb_x + (placement.controls_left ? -48 : 48)}px`,
+    "--tools-x": `${placement.orb_x + (placement.controls_left ? -72 : 72)}px`,
+  } as CSSProperties : undefined;
+  return <div ref={layer} className={`companion-layer mode-${mode} ${placement?.controls_left === false ? "controls-right" : "controls-left"}`} style={positionStyle} onPointerEnter={() => { if (modeRef.current === "tools") clearTimeout(hideTimer.current); }} onPointerLeave={leave}>
     <button data-hit-region className="orb-translate-shortcut" title="快捷翻译" aria-label="快捷翻译" onClick={() => { if (modeRef.current === "translate") { void command("compact_focus").then(() => translationInput.current?.focus()); } else changeMode("translate"); }}>译</button>
-    {mode === "tools" && <span className="orb-status-text">{label}</span>}
+
     {mode === "tools" && <div data-hit-region className="orb-tools" aria-label="陪伴球操作">
 
-      <button title="最近对话" aria-label="最近对话" onClick={() => changeMode("chat")}><span aria-hidden="true">☰</span></button>
+      <button title="打开主界面" aria-label="打开主界面" onClick={() => { changeMode("orb"); void command("compact_open_main", { settings: false }); }}><span aria-hidden="true">☰</span></button>
       <button title="更多操作" aria-label="更多操作" onClick={() => changeMode("more")}>···</button>
       <button className={voiceRecording || status.phase === "recording" ? "orb-voice active" : "orb-voice"} disabled={!ready} title={voiceRecording || status.phase === "recording" ? "停止录音并发送" : "开始录音"} aria-label={voiceRecording || status.phase === "recording" ? "停止录音并发送" : "开始录音"} aria-pressed={voiceRecording || status.phase === "recording"} onClick={toggleVoice}>
         {voiceRecording || status.phase === "recording" ? "■" : <svg aria-hidden="true" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="1.8"><rect x="9" y="3" width="6" height="12" rx="3" /><path d="M6 11v1a6 6 0 0 0 12 0v-1M12 18v3M9 21h6" /></svg>}
@@ -284,15 +320,24 @@ export function FloatingPanel({ settings, messages, streamText, ready, status, e
     {mode === "bubble" && <div data-hit-region className={`orb-bubble ${companionError ? "has-error" : ""}`} role={companionError ? "alert" : "status"}>
       <button className="orb-close" aria-label="收起提示" onClick={() => changeMode("orb")}>×</button><MarkdownText text={bubble || label} className="orb-bubble-text" />
     </div>}
-    {card && <section data-hit-region className="orb-card" aria-label={mode === "translate" ? "快捷翻译" : mode === "chat" ? "最近对话" : "更多操作"}>
-      <header><strong>{mode === "translate" ? "快捷翻译" : mode === "chat" ? "最近对话" : "陪伴设置"}</strong><button className="orb-close" aria-label="收起面板" onClick={() => changeMode("orb")}>×</button></header>
+    {card && <section data-hit-region className="orb-card" aria-label={mode === "translate" ? "快捷翻译" : ["chat", "tools"].includes(mode) ? "最近对话" : "更多操作"}>
+      <header><strong>{mode === "translate" ? "快捷翻译" : ["chat", "tools"].includes(mode) ? "最近对话" : "陪伴设置"}</strong><button className="orb-close" aria-label="收起面板" onClick={() => changeMode("orb")}>×</button></header>
       {error && mode !== "translate" && <p className="translation-error orb-operation-error" role="alert">{error}</p>}
-      {mode === "chat" ? <div className="orb-card-content floating-chat">
+      {["chat", "tools"].includes(mode) ? <div className="orb-card-content floating-chat">
         {!messages.length && !streamText && <div className="orb-empty">点击麦克风按钮说话。<small>你也可以安心忙自己的事情。</small></div>}
-        {messages.slice(-30).map(m => <article key={m.id} className={`floating-message ${m.role === "user" ? "from-user" : ""}`}><small>{m.role === "user" ? "你" : m.role === "proactive" ? "主动陪伴" : "Linger"}</small>{m.role === "user" ? <p>{m.content}</p> : <MarkdownText text={m.content} />}</article>)}
+        {messages.slice(mode === "tools" ? -6 : -30).map(m => <article key={m.id} className={`floating-message ${m.role === "user" ? "from-user" : ""}`}><small>{m.role === "user" ? "你 · 输入 / 语音转写" : m.role === "proactive" ? "主动陪伴" : "Linger"}</small>{m.role === "user" ? <p>{m.content}</p> : <MarkdownText text={m.content} />}</article>)}
         {streamText && <article className="floating-message"><small>正在回应</small><MarkdownText text={streamText} /></article>}<div ref={bottom} />
       </div> : mode === "translate" ? <div className="orb-card-content floating-translation">
         <div className="translation-direction"><strong>中文 <span>→</span> {settings.translation_language}</strong><small>{settings.translation_model}</small></div>
+        <label className="translation-style">翻译风格
+          <select value={translationStyle} disabled={pending} onChange={e => {
+            request.current += 1; setResult(""); setCopied(false); setError("");
+            setTranslationStyle(e.target.value as Settings["translation_style"]);
+          }}>
+            {translationStyles.map(style => <option key={style.value} value={style.value}>{style.label}</option>)}
+          </select>
+        </label>
+        {translationStyle === "custom" && !settings.translation_custom_prompt.trim() && <p className="translation-help">请先在主窗口设置中填写并保存自定义翻译要求。</p>}
         <label className="checkbox-label translation-auto-copy"><input type="checkbox" checked={settings.translation_auto_copy || false} disabled={!ready || autoCopySaving} onChange={e => {
           setAutoCopySaving(true); setError("");
           void onSetTranslationAutoCopy(e.target.checked).catch(e => setError(String(e))).finally(() => setAutoCopySaving(false));
@@ -302,7 +347,7 @@ export function FloatingPanel({ settings, messages, streamText, ready, status, e
         <div className="translation-actions"><small className={length > 4000 ? "over-limit" : ""}>{length} / 4000</small><button className="primary-button" disabled={!ready || autoCopySaving || pending || !text.trim() || length > 4000} onClick={() => void translate()}>{pending ? "翻译中…" : "翻译 ↵"}</button></div>
         {error && <p className="translation-error" role="alert">{error}</p>}
         {result && <div className="translation-result"><div><label htmlFor="translation-output">译文</label></div><textarea ref={output} id="translation-output" readOnly value={result} /></div>}
-        <p className="translation-help">Enter 翻译 · Shift+Enter 换行 · Esc 收起<br />{settings.translation_auto_copy ? "已开启自动复制，译文会替换剪贴板内容。" : "目标语言、模型与自动复制可在主窗口设置。"}</p>
+        <p className="translation-help">Enter 翻译 · Shift+Enter 换行 · Esc 收起<br />{settings.translation_auto_copy ? "已开启自动复制，译文会替换剪贴板内容。" : "默认风格、自定义要求、语言及模型可在主窗口设置。"}</p>
       </div> : <div className="orb-card-content orb-menu">
         {sourceControls}
         <button disabled={observationBusy} onClick={onToggleObserving}>{observationBusy ? "正在检查…" : settings.observing ? "暂停主动陪伴" : "开启主动陪伴"}<span>{settings.observing ? "正在陪伴" : "已暂停"}</span></button>
@@ -318,10 +363,10 @@ export function FloatingPanel({ settings, messages, streamText, ready, status, e
     </form>}
     {mode === "translate" && result && <button className="orb-copy-button" onClick={() => void copy()}>{copied ? "✓ 已复制，可以粘贴了" : "复制译文"}</button>}
     </section>}
-    <button data-hit-region className={`companion-orb phase-${phase} ${settings.observing ? "observation-enabled" : ""} ${observingPulse ? "observing-pulse" : ""} ${companionError || error ? "with-error" : ""}`} aria-label={`陪伴球 · ${settings.observing ? "读屏陪伴已开启" : "读屏陪伴已暂停"} · ${label}，单击打字，拖动移动`} title={`${companionError || error || label} · ${settings.observing ? "读屏陪伴已开启" : "读屏陪伴已暂停"} · 单击打字 / 拖动移动`} disabled={!ready}
+    <button data-hit-region className={`companion-orb phase-${phase} ${settings.observing ? "observation-enabled" : ""} ${observingPulse ? "observing-pulse" : ""} ${companionError || error ? "with-error" : ""}`} aria-label={`陪伴球 · ${settings.observing ? "读屏陪伴已开启" : "读屏陪伴已暂停"} · ${label}，单击打字，双击打开主界面，拖动移动`} title={`${companionError || error || label} · ${settings.observing ? "读屏陪伴已开启" : "读屏陪伴已暂停"} · 单击打字 / 双击主界面 / 拖动移动`} disabled={!ready}
       style={{ "--mic-level": level } as CSSProperties}
-      onPointerEnter={() => { clearTimeout(hideTimer.current); if (["orb", "bubble"].includes(modeRef.current) && !press.current) changeMode("tools"); }}
-      onPointerDown={beginPress} onPointerMove={movePress} onPointerUp={() => endPress(true)} onPointerCancel={() => endPress(false)} onLostPointerCapture={() => { if (!press.current?.dragging) endPress(false); }} onContextMenu={e => { e.preventDefault(); changeMode("more"); }}
+      onPointerEnter={hoverOrb}
+      onDoubleClick={e => e.preventDefault()} onPointerDown={beginPress} onPointerMove={movePress} onPointerUp={() => endPress(true)} onPointerCancel={() => endPress(false)} onLostPointerCapture={() => { if (!press.current?.dragging) endPress(false); }} onContextMenu={e => { e.preventDefault(); changeMode("more"); }}
       onKeyDown={e => { if ((e.key === "Enter" || e.key === " ") && !e.repeat) { e.preventDefault(); changeMode("chat"); } }} onBlur={() => endPress(false)}>
       {settings.observing && <span className="orb-observation-halo" aria-hidden="true" />}<span className="orb-ring" /><span className="orb-face" aria-hidden="true"><i /><i /></span>{(companionError || error) && <span className="orb-error-dot" />}
     </button>
