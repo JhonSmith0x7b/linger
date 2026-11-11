@@ -562,7 +562,10 @@ export default function App() {
     roleDrafts.current[draft.character_id || "custom"] = draft.personality;
     ttsDrafts.current[draft.character_id || "custom"] = cardTts;
     const preset = characterFor(id);
-    setCardTts(ttsDrafts.current[id] ?? characterTts(draft, id));
+    // A newly added Melody card starts with the user's existing voice.
+    // Saved profiles and unsaved edits always take precedence.
+    const inheritVoice = id === "melody" && !draft.character_tts?.[id] && !draft.character_voices?.[id];
+    setCardTts(ttsDrafts.current[id] ?? (inheritVoice ? structuredClone(cardTts) : characterTts(draft, id)));
     setDraft((prev) => ({
       ...prev,
       character_id: id,

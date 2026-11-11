@@ -10,7 +10,7 @@ export interface LibraryVoice {
   created_at: string;
   in_use_by: string[];
 }
-const characterNames: Record<string, string> = { custom: "自定义角色", haruhi: "凉宫春日", yukino: "雪之下雪乃", fujiko: "峰不二子", shiori: "栞", koharu: "小晴", rin: "凛" };
+const characterNames: Record<string, string> = { custom: "自定义角色", haruhi: "凉宫春日", yukino: "雪之下雪乃", fujiko: "峰不二子", melody: "泽音", shiori: "栞", koharu: "小晴", rin: "凛" };
 const statusNames: Record<string, string> = { OK: "可使用", DEPLOYING: "处理中", UNDEPLOYED: "审核未通过", UNKNOWN: "尚未查询" };
 function errorText(error: unknown) { return error instanceof Error ? error.message : String(error); }
 

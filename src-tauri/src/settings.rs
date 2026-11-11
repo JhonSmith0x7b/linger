@@ -3,8 +3,8 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 
 // Retired IDs remain valid only for hidden saved edits and voice configurations.
-const CHARACTER_IDS: [&str; 7] = [
-    "custom", "haruhi", "yukino", "fujiko", "shiori", "koharu", "rin",
+const CHARACTER_IDS: [&str; 8] = [
+    "custom", "haruhi", "yukino", "fujiko", "melody", "shiori", "koharu", "rin",
 ];
 const RETIRED_CHARACTER_IDS: [&str; 3] = ["shiori", "koharu", "rin"];
 
@@ -449,9 +449,9 @@ impl Settings {
         if self
             .character_personalities
             .iter()
-            .any(|(id, text)| !CHARACTER_IDS.contains(&id.as_str()) || text.len() > 2400)
+            .any(|(id, text)| !CHARACTER_IDS.contains(&id.as_str()) || text.len() > 4800)
         {
-            return Err("角色卡设定无效，每张角色卡最多 2400 字节".into());
+            return Err("角色卡设定无效，每张角色卡最多 4800 字节".into());
         }
         for (id, profile) in &self.character_voices {
             if !CHARACTER_IDS.contains(&id.as_str()) {
@@ -525,8 +525,8 @@ impl Settings {
         if self.translation_custom_prompt.chars().count() > 1000 {
             return Err("自定义翻译风格最多 1000 个字符".into());
         }
-        if self.personality.len() > 2400 || self.watch_instruction.len() > 600 {
-            return Err("人格配置最多 2400 字节，关注说明最多 600 字节，请精简以控制上下文".into());
+        if self.personality.len() > 4800 || self.watch_instruction.len() > 600 {
+            return Err("人格配置最多 4800 字节，关注说明最多 600 字节，请精简以控制上下文".into());
         }
         self.character_personalities
             .insert(self.character_id.clone(), self.personality.clone());
@@ -631,7 +631,7 @@ mod tests {
 
     #[test]
     fn new_character_presets_validate_and_existing_haruhi_edits_win_migration() {
-        for id in ["haruhi", "yukino", "fujiko"] {
+        for id in ["haruhi", "yukino", "fujiko", "melody"] {
             let mut settings = Settings {
                 character_id: id.into(),
                 personality: builtin_personality(id).unwrap(),
@@ -666,6 +666,58 @@ mod tests {
         let restored = Settings::from_stored(serde_json::to_value(stored).unwrap()).unwrap();
         assert_eq!(restored.personality, "用户已经修改的新角色");
         assert_eq!(restored.active_voice().unwrap(), &existing);
+    }
+
+    #[test]
+    fn melody_full_personality_survives_save_and_load() {
+        let personality = builtin_personality("melody").unwrap();
+        assert_eq!(personality.len(), 2664);
+        assert!(personality.contains("非官方角色演绎，不声称自己是真人或得到本人授权"));
+        assert!(personality.contains("以下是原创示例，只展示互动方式，不是主播原话："));
+        assert_eq!(personality.matches("用户：").count(), 3);
+        assert!(personality.ends_with("先跟我说一件，别一口气把今天全判输了。"));
+        let mut settings = Settings {
+            character_id: "melody".into(),
+            personality: personality.clone(),
+            ..Settings::default()
+        };
+        settings
+            .character_voices
+            .insert("melody".into(), VoiceProfile::default());
+        settings
+            .character_personalities
+            .insert("melody".into(), personality.clone());
+        settings.validate().unwrap();
+        let restored = Settings::from_stored(serde_json::to_value(&settings).unwrap()).unwrap();
+        assert_eq!(restored.character_id, "melody");
+        assert_eq!(restored.personality, personality);
+        assert_eq!(restored.character_personalities["melody"], personality);
+        assert_eq!(
+            restored.active_voice().unwrap(),
+            settings.active_voice().unwrap()
+        );
+    }
+
+    #[test]
+    fn personality_limit_applies_to_active_and_saved_cards_in_utf8_bytes() {
+        let limit_text = "字".repeat(1600);
+        let mut settings = Settings {
+            personality: limit_text.clone(),
+            ..Settings::default()
+        };
+        settings
+            .character_personalities
+            .insert("melody".into(), limit_text.clone());
+        settings.validate().unwrap();
+        settings.personality.push('a');
+        assert!(settings.validate().unwrap_err().contains("4800 字节"));
+        settings.personality = limit_text;
+        settings
+            .character_personalities
+            .get_mut("melody")
+            .unwrap()
+            .push('a');
+        assert!(settings.validate().unwrap_err().contains("4800 字节"));
     }
 
     #[test]
