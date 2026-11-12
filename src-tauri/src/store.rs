@@ -159,6 +159,7 @@ impl Store {
         Ok(rows)
     }
     /// Literal substring lookup works for short Chinese queries without FTS tokenization assumptions.
+    #[cfg(test)]
     pub fn search_messages(&self, query: &str, limit: usize) -> Result<Vec<Message>> {
         if query.trim().is_empty() {
             return Ok(vec![]);

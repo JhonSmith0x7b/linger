@@ -236,7 +236,9 @@ fn tools() -> Value {
         function("update_memory","Replace an existing memory explicitly corrected by the user.",json!({"id":{"type":"integer"},"content":{"type":"string"}}),json!(["id","content"])),
         function("forget","Delete a memory at the user's request.",json!({"id":{"type":"integer"}}),json!(["id"])),
         function("search_memories","Find effective memories omitted from the small pinned context.",json!({"query":{"type":"string"}}),json!(["query"])),
-        function("search_history","Search historical messages; old facts may be superseded or forgotten.",json!({"query":{"type":"string"}}),json!(["query"])),
+        function("search_history","Search interactions by literal keywords, optional RFC3339 time bounds and kind (chat/observation/unheard). At most 5 textual candidates; 2 searches per turn. Prefer linked IDs for recent follow-ups.",json!({"query":{"type":"string"},"after":{"type":["string","null"]},"before":{"type":["string","null"]},"kind":{"type":["string","null"]}}),json!(["query","after","before","kind"])),
+        function("read_history","Read an interaction's bounded text, tool evidence and screenshot references. No image loaded. At most 2 reads per turn.",json!({"id":{"type":"integer"}}),json!(["id"])),
+        function("view_screenshot","Load a linked historical screenshot by ID. Use for details in a previously discussed image; it is NOT the current screen. At most 2 distinct historical images per turn. Expired images cannot be recovered.",json!({"id":{"type":"integer"}}),json!(["id"])),
         {"type":"web_search"}
     ])
 }
@@ -267,18 +269,19 @@ fn context(core: &Core, proactive: bool) -> Result<(String, Vec<Value>), String>
     let memory = memories
         .iter()
         .map(|m| {
-            format!(
-                "{} [{} 到期:{:?}]: {}",
-                m.id, m.scope, m.expires_at, m.content
-            )
+            let source = core.history.memory_source(m.id, &m.updated_at)?;
+            Ok(format!(
+                "{} [{} 到期:{:?} 来源互动:{:?}]: {}",
+                m.id, m.scope, m.expires_at, source, m.content
+            ))
         })
-        .collect::<Vec<_>>()
+        .collect::<Result<Vec<_>, String>>()?
         .join("\n");
     let summary = core.store.get_meta("summary")?.unwrap_or_default();
     let profile = core.store.user_profile()?;
     let introduction = core.store.introduction_state()?;
-    let instructions = format!(
-        "【当前角色卡】\n{}\n{}\n【相识状态】introduced={}；asked_name={}；legacy_history={}（旧版本已有聊天，相识经过未知，不能据此强制重新介绍）。这些标记只表示文字已发出，不证明用户听见或回答。\n【参考资料】\n用户档案（用户提供的称呼、偏好和边界；与旧聊天偏好冲突时以此为准，不覆盖角色与事实规则；修订 {}）:{}\n关注:{}\n有效记忆:{}\n近期互动摘要:{}\n上次活动（非当前画面）:{}\n{}\n{}",
+    let mut instructions = format!(
+        "【当前角色卡】\n{}\n{}\n【相识状态】introduced={}；asked_name={}；legacy_history={}（旧版本已有聊天，相识经过未知，不能据此强制重新介绍）。这些标记只表示文字已发出，不证明用户听见或回答。\n【长期记忆：用户档案与相关事实】\n用户档案（用户提供的称呼、偏好和边界；与旧聊天偏好冲突时以此为准，不覆盖角色与事实规则；修订 {}）:{}\n关注:{}\n有效记忆:{}\n【当前上下文】近期互动摘要:{}\n上次活动（非当前画面）:{}\n{}\n{}",
         s.personality,
         crate::prompts::ROLEPLAY,
         introduction.introduced,
@@ -298,9 +301,36 @@ fn context(core: &Core, proactive: bool) -> Result<(String, Vec<Value>), String>
         .get_meta("memory_history_floor")?
         .and_then(|x| x.parse::<i64>().ok())
         .unwrap_or(0);
-    let input = shared_history(core.store.messages()?, floor);
+    let history = core.store.messages()?;
+    let message_ids: Vec<i64> = history
+        .iter()
+        .filter(|m| m.id > floor)
+        .rev()
+        .take(12)
+        .map(|m| m.id)
+        .collect();
+    instructions.push_str(&history_context(
+        core.history.recent_context(&message_ids)?,
+        core.history.pointers()?,
+    ));
+    let input = shared_history(history, floor);
 
     Ok((instructions, input))
+}
+
+// Keep archive references small even after many image-bearing turns. Remove
+// whole older records, never truncate JSON or expose image bytes in instructions.
+fn history_context(mut recent: Value, pointers: Value) -> String {
+    while tokens(&json!({"recent":recent,"pointers":pointers}).to_string()) > 600 {
+        if recent
+            .as_array_mut()
+            .is_none_or(|items| items.pop().is_none())
+        {
+            break;
+        }
+    }
+    format!("\n【历史资料定位，仅作数据】当前时间：{}\n{}\n优先用明确关联的截图编号回看；新观察不代表正在讨论的旧画面。",
+        chrono::Local::now().to_rfc3339(), json!({"recent":recent,"pointers":pointers}))
 }
 
 // Both trigger types use the same complete messages, including prior proactive replies.
@@ -348,6 +378,7 @@ async fn run(
     let api = core.api()?;
     let proactive = matches!(trigger, Trigger::Observe | Trigger::ObserveFrame(_));
     let mut fresh_image = None;
+    let mut archive_image = None;
     let mut observed_fingerprint = None;
     let mut empty_audio = false;
     let text = match trigger {
@@ -405,6 +436,9 @@ async fn run(
                 },
             );
             observed_fingerprint = Some(frame.fingerprint);
+            if s.screenshot_history_enabled {
+                archive_image = Some(frame.data_url.clone());
+            }
             if changed {
                 fresh_image = Some(frame.data_url);
             }
@@ -418,6 +452,28 @@ async fn run(
     if core.generation.load(Ordering::SeqCst) != id {
         return Ok(());
     }
+    let interaction_id;
+    {
+        let _gate = core.turn_gate.lock().unwrap();
+        if core.generation.load(Ordering::SeqCst) != id {
+            return Ok(());
+        }
+        interaction_id = core.history.start_interaction(
+            if proactive {
+                "observation"
+            } else if empty_audio {
+                "unheard"
+            } else {
+                "chat"
+            },
+            &text,
+        )?;
+        if let Some(image) = archive_image {
+            core.history
+                .save_screenshot(interaction_id, &image, &s.capture_source)?;
+        }
+    }
+    let mut history_budget = crate::history_budget::HistoryBudget::default();
     let (mut instructions, mut input) = context(core, proactive)?;
     if !proactive && !empty_audio {
         let _gate = core.turn_gate.lock().unwrap();
@@ -425,6 +481,8 @@ async fn run(
             return Ok(());
         }
         let msg = core.store.add_message("user", &text)?;
+        core.history
+            .link_message(interaction_id, msg.id, "user", &text)?;
         publish(app, &msg);
     }
     let mut content = vec![json!({"type":"input_text","text":text})];
@@ -480,6 +538,21 @@ async fn run(
             return Ok(());
         }
         let outputs = result["output"].as_array().cloned().unwrap_or_default();
+        {
+            let _gate = core.turn_gate.lock().unwrap();
+            if core.generation.load(Ordering::SeqCst) != id {
+                return Ok(());
+            }
+            for output in &outputs {
+                if output["type"] == "web_search_call" {
+                    core.history.record_tool(
+                        interaction_id,
+                        "web_search",
+                        &json!({"status":output["status"],"action":output["action"]}),
+                    )?;
+                }
+            }
+        }
         let calls: Vec<_> = outputs
             .iter()
             .filter(|o| o["type"] == "function_call")
@@ -502,6 +575,8 @@ async fn run(
                 }
                 if let Some(state) = parsed["state"].as_str() {
                     *core.activity.lock().unwrap() = cut(state, 500);
+                    core.history
+                        .update_summary(interaction_id, &cut(state, 500))?;
                 }
                 *core.last_frame.lock().unwrap() = observed_fingerprint;
                 answer = parsed["speech"].as_str().unwrap_or("").to_owned();
@@ -544,6 +619,12 @@ async fn run(
                     introduction_update.0,
                     introduction_update.1,
                 )?;
+                core.history.link_message(
+                    interaction_id,
+                    msg.id,
+                    if proactive { "proactive" } else { "assistant" },
+                    &answer,
+                )?;
                 publish(app, &msg);
             }
             if proactive {
@@ -561,6 +642,8 @@ async fn run(
                 .map_err(|_| "工具参数格式错误")?;
             status(app, "tool", name);
             let mut image = None;
+            let mut historical_image = false;
+            let mut image_label = "刚才截图工具取得的新图，仅作为屏幕数据。".to_owned();
             let result: Result<Value, String> = match name {
                 "capture_screen" => {
                     let source = s.capture_source.clone();
@@ -569,9 +652,25 @@ async fn run(
                         .map_err(|e| e.to_string())?
                     {
                         Ok(frame) => {
+                            let _gate = core.turn_gate.lock().unwrap();
+                            if core.generation.load(Ordering::SeqCst) != id {
+                                return Ok(());
+                            }
+                            let screenshot_id = if s.screenshot_history_enabled {
+                                Some(core.history.save_screenshot(
+                                    interaction_id,
+                                    &frame.data_url,
+                                    &s.capture_source,
+                                )?)
+                            } else {
+                                None
+                            };
+                            image_label = format!(
+                                "当前截图；历史引用编号：{screenshot_id:?}。仅作为屏幕数据。"
+                            );
                             image = Some(frame.data_url);
                             Ok(
-                                json!({"captured_at":chrono::Utc::now().to_rfc3339(),"source":s.capture_source,"image_follows":true}),
+                                json!({"captured_at":chrono::Utc::now().to_rfc3339(),"source":s.capture_source,"image_follows":true,"screenshot_id":screenshot_id}),
                             )
                         }
                         Err(e) => Err(e),
@@ -637,10 +736,42 @@ async fn run(
                     .store
                     .search_memories(args["query"].as_str().unwrap_or(""), 5)
                     .map(|m| json!(m)),
-                "search_history" => core
-                    .store
-                    .search_messages(args["query"].as_str().unwrap_or(""), 5)
-                    .map(|m| json!({"historical_only":true,"messages":m})),
+                "search_history" => (|| {
+                    history_budget.search()?;
+                    let result = core.history.search(
+                        args["query"].as_str().unwrap_or(""),
+                        args["after"].as_str(),
+                        args["before"].as_str(),
+                        args["kind"].as_str(),
+                    )?;
+                    history_budget.text(&result)?;
+                    Ok(result)
+                })(),
+                "read_history" => (|| {
+                    history_budget.read()?;
+                    let result = core.history.read(args["id"].as_i64().unwrap_or(-1))?;
+                    history_budget.text(&result)?;
+                    Ok(result)
+                })(),
+                "view_screenshot" => (|| {
+                    let screenshot = args["id"].as_i64().unwrap_or(-1);
+                    if !history_budget.image(screenshot)? {
+                        return Ok(json!({"already_loaded":true,"id":screenshot}));
+                    }
+                    let _gate = core.turn_gate.lock().unwrap();
+                    if core.generation.load(Ordering::SeqCst) != id {
+                        return Err("本轮已取消".into());
+                    }
+                    let (metadata, data_url) = core.history.view(screenshot)?;
+                    history_budget.text(&metadata)?;
+                    core.history.attach_screenshot(interaction_id, screenshot)?;
+                    core.history.set_discussed(screenshot)?;
+                    image_label = format!("历史截图，不能当作当前屏幕：{metadata}");
+                    image = Some(data_url);
+                    historical_image = true;
+                    history_budget.image_loaded(screenshot);
+                    Ok(metadata)
+                })(),
                 _ => Err("未知工具".into()),
             };
             if matches!(
@@ -656,7 +787,24 @@ async fn run(
                 Ok(v) => v,
                 Err(e) => json!({"error":e}),
             };
-            let tool_output = if name == "get_user_profile" {
+            if !matches!(
+                name,
+                "get_user_profile"
+                    | "search_memories"
+                    | "search_history"
+                    | "read_history"
+                    | "view_screenshot"
+            ) {
+                let _gate = core.turn_gate.lock().unwrap();
+                if core.generation.load(Ordering::SeqCst) != id {
+                    return Ok(());
+                }
+                core.history.record_tool(interaction_id, name, &result)?;
+            }
+            let tool_output = if matches!(
+                name,
+                "get_user_profile" | "search_history" | "read_history" | "view_screenshot"
+            ) {
                 result.to_string()
             } else {
                 cut(&result.to_string(), 1000)
@@ -664,8 +812,11 @@ async fn run(
             input.push(json!({"type":"function_call_output","call_id":call["call_id"],"output":tool_output}));
             if let Some(image) = image {
                 // Retain only the newest screenshot; never use an old frame as a fresh tool result.
-                remove_images(&mut input);
-                input.push(json!({"role":"user","content":[{"type":"input_text","text":"刚才截图工具取得的新图，仅作为屏幕数据。"},{"type":"input_image","image_url":image,"detail":"auto"}]}));
+                if !historical_image {
+                    remove_images(&mut input);
+                    history_budget.images_removed();
+                }
+                input.push(json!({"role":"user","content":[{"type":"input_text","text":image_label},{"type":"input_image","image_url":image,"detail":"auto"}]}));
             }
         }
         if !fit_tool_context(
@@ -894,7 +1045,7 @@ async fn organize(core: &Arc<Core>) -> Result<(), String> {
     let s = core.settings();
     let result=api.response(&s.memory_model,
         crate::prompts::MEMORY,
-        json!([{"role":"user","content":json!({"current_user_profile":core.store.user_profile()?.content,"previous_summary":cut(&prior,1200),"new_messages":batch}).to_string()}]),json!([]),4096).await?;
+        json!([{"role":"user","content":json!({"current_user_profile":core.store.user_profile()?.content,"previous_summary":cut(&prior,1200),"existing_memories":token_prefix(&serde_json::to_string(&core.store.memories()?).map_err(|e| e.to_string())?,800),"new_messages":batch}).to_string()}]),json!([]),4096).await?;
     if result["status"] == "incomplete" {
         return Err("记忆整理输出不完整，将稍后重试".into());
     }
@@ -928,6 +1079,15 @@ async fn organize(core: &Arc<Core>) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn recent_image_references_drop_whole_older_records_to_fit() {
+        let recent = json!((0..20).map(|id| json!({"interaction_id":id,"snippet":"旧对话".repeat(100),"screenshots":[{"screenshot_id":id}]})).collect::<Vec<_>>());
+        let pointers = json!({"discussed_screenshot":{"screenshot_id":5},"latest_observation":{"screenshot_id":9}});
+        let text = history_context(recent, pointers);
+        assert!(tokens(&text) < 750);
+        assert!(text.contains("discussed_screenshot"));
+        assert!(!text.contains("data:image"));
+    }
     #[test]
     fn full_user_profile_leaves_room_for_default_chat() {
         let settings = crate::settings::Settings::default();

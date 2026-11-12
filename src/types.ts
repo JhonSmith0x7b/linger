@@ -44,6 +44,7 @@ export interface Settings {
   observing: boolean;
   compact_visible: boolean;
   capture_source: string;
+  screenshot_history_enabled: boolean;
   watch_instruction: string;
   shortcut: string;
 }

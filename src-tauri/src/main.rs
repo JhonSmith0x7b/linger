@@ -2,6 +2,8 @@
 mod api;
 mod credentials;
 mod devices;
+mod history;
+mod history_budget;
 mod overlay;
 mod prompts;
 #[cfg(test)]
@@ -34,6 +36,7 @@ pub struct Core {
     last_status: Mutex<serde_json::Value>,
     observation_status: Mutex<serde_json::Value>,
     store: Store,
+    history: history::History,
     devices: Devices,
     generation: AtomicU64,
     turn_gate: Mutex<()>,
@@ -579,6 +582,13 @@ fn save_settings(
         return Err(e);
     }
     core.interrupt_locked();
+    let cleanup = if !settings.screenshot_history_enabled {
+        core.history
+            .clear_screenshots()
+            .map_err(|e| format!("截图保存已关闭，但旧截图清理失败：{e}"))
+    } else {
+        Ok(())
+    };
     core.devices.set_volume(settings.volume);
     core.devices.set_audio_devices(
         settings.audio_input_device.clone(),
@@ -588,7 +598,7 @@ fn save_settings(
     *core.last_frame.lock().unwrap() = None;
     core.activity.lock().unwrap().clear();
     let _ = app.emit("linger:settings", settings);
-    Ok(())
+    cleanup
 }
 #[tauri::command]
 fn list_messages(
@@ -617,8 +627,18 @@ fn save_user_profile(
     Ok(profile)
 }
 #[tauri::command]
+fn clear_screenshot_history(app: tauri::AppHandle, core: State<Arc<Core>>) -> Result<(), String> {
+    let _gate = core.turn_gate.lock().unwrap();
+    core.interrupt_locked();
+    core.history.clear_screenshots()?;
+    *core.last_frame.lock().unwrap() = None;
+    status(&app, "idle", "截图历史已清空");
+    Ok(())
+}
+#[tauri::command]
 fn clear_conversation(app: tauri::AppHandle, core: State<Arc<Core>>) -> Result<(), String> {
     let _gate = core.turn_gate.lock().unwrap();
+    core.history.clear_all()?;
     core.store.clear_conversation()?;
     core.interrupt_locked();
     core.recording_epoch.fetch_add(1, Ordering::SeqCst);
@@ -1090,6 +1110,14 @@ fn main() {
             let dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&dir)?;
             let store = Store::open(&dir.join("linger.sqlite3")).map_err(std::io::Error::other)?;
+            let history = history::History::open(&dir).map_err(std::io::Error::other)?;
+            let mut after = 0;
+            loop {
+                let batch = store.messages_after(after, 1000).map_err(std::io::Error::other)?;
+                if batch.is_empty() { break; }
+                after = batch.last().unwrap().id;
+                history.import_messages(&batch).map_err(std::io::Error::other)?;
+            }
             let raw = store.load_settings().map_err(std::io::Error::other)?;
             let mut settings = match &raw {
                 Some(value) => {
@@ -1129,6 +1157,7 @@ fn main() {
                 observation_status: Mutex::new(json!({"phase":"idle","detail":"本次启动尚未进行自动观察","at":null,"captured_at":null})),
                 last_status: Mutex::new(json!({"phase":"idle","detail":"在这里陪你"})),
                 store,
+                history,
                 devices: Devices::new(),
                 generation: AtomicU64::new(0),
                 turn_gate: Mutex::new(()),
@@ -1148,7 +1177,18 @@ fn main() {
             });
             core.devices.set_volume(core.settings().volume);
             core.devices.set_audio_devices(core.settings().audio_input_device, core.settings().audio_output_device);
+            if !core.settings().screenshot_history_enabled {
+                core.history.clear_screenshots().map_err(std::io::Error::other)?;
+            }
             app.manage(core.clone());
+            let archive_core = core.clone();
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    let c = archive_core.clone();
+                    let _ = tauri::async_runtime::spawn_blocking(move || c.history.cleanup()).await;
+                }
+            });
             // A broken capture is discarded by the device worker. End the logical
             // turn too, so a recovered device never looks like resumed recording.
             let microphone_core = core.clone();
@@ -1282,6 +1322,7 @@ fn main() {
             get_user_profile,
             save_user_profile,
             clear_conversation,
+            clear_screenshot_history,
             list_memories,
             save_memory,
             update_memory,

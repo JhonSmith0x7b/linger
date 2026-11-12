@@ -249,6 +249,7 @@ pub struct Settings {
     pub observing: bool,
     pub compact_visible: bool,
     pub capture_source: String,
+    pub screenshot_history_enabled: bool,
     pub watch_instruction: String,
     pub shortcut: String,
 }
@@ -280,6 +281,7 @@ impl Default for Settings {
             observing: false,
             compact_visible: true,
             capture_source: "monitor:primary".into(),
+            screenshot_history_enabled: true,
             watch_instruction: String::new(),
             shortcut: "CommandOrControl+Shift+Space".into(),
         }
@@ -813,6 +815,25 @@ mod tests {
         );
         value["compact_visible"] = json!(false);
         assert!(!Settings::from_stored(value).unwrap().compact_visible);
+    }
+
+    #[test]
+    fn screenshot_history_defaults_on_and_preserves_disabled_choice() {
+        let mut stored = serde_json::to_value(Settings::default()).unwrap();
+        stored
+            .as_object_mut()
+            .unwrap()
+            .remove("screenshot_history_enabled");
+        assert!(
+            Settings::from_stored(stored.clone())
+                .unwrap()
+                .screenshot_history_enabled
+        );
+        stored["screenshot_history_enabled"] = json!(false);
+        let disabled = Settings::from_stored(stored).unwrap();
+        assert!(!disabled.screenshot_history_enabled);
+        let restored = Settings::from_stored(serde_json::to_value(disabled).unwrap()).unwrap();
+        assert!(!restored.screenshot_history_enabled);
     }
 
     #[test]

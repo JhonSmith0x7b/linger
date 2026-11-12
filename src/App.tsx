@@ -46,6 +46,7 @@ const defaults: Settings = {
   observing: false,
   compact_visible: true,
   capture_source: "monitor:primary",
+  screenshot_history_enabled: true,
   watch_instruction: "",
   shortcut: "CommandOrControl+Shift+Space",
 };
@@ -168,6 +169,9 @@ export default function App() {
   const [confirmClear, setConfirmClear] = useState(false);
   const [clearingConversation, setClearingConversation] = useState(false);
   const clearingRef = useRef(false);
+  const [confirmClearScreenshots, setConfirmClearScreenshots] = useState(false);
+  const [clearingScreenshots, setClearingScreenshots] = useState(false);
+  const clearingScreenshotsRef = useRef(false);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [hasOlderMessages, setHasOlderMessages] = useState(false);
   const [browsingHistory, setBrowsingHistory] = useState(false);
@@ -526,6 +530,16 @@ export default function App() {
     } catch (error) { report(error); }
     finally { clearingRef.current = false; setClearingConversation(false); }
   }
+  async function clearScreenshotHistory() {
+    if (clearingScreenshotsRef.current || saving) return;
+    clearingScreenshotsRef.current = true; setClearingScreenshots(true); setError("");
+    try {
+      await invoke("clear_screenshot_history");
+      setConfirmClearScreenshots(false);
+      setNotice("已清空保存的截图，文字对话和记忆已保留。");
+    } catch (error) { report(error); }
+    finally { clearingScreenshotsRef.current = false; setClearingScreenshots(false); }
+  }
   function resumeLatestHistory() {
     if (!historyMode.current) return;
     historyMode.current = false;
@@ -560,6 +574,7 @@ export default function App() {
   useEffect(() => {
     if (page === "memory" && ready) void refreshMemories();
     if (page === "settings") setNotice("");
+    setConfirmClearScreenshots(false);
     // Keep unsaved character and connection drafts when navigating between pages.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [page, ready]);
@@ -598,7 +613,7 @@ export default function App() {
   }
   async function saveSettings(e: FormEvent) {
     e.preventDefault();
-    if (capturingShortcut) return;
+    if (capturingShortcut || clearingScreenshotsRef.current) return;
     setSaving(true);
     setError("");
     setNotice("");
@@ -1559,14 +1574,14 @@ export default function App() {
                   </div>
                   <ShortcutRecorder
                     value={draft.shortcut}
-                    disabled={!ready || saving || autoCopySaving || capturingShortcut}
+                    disabled={!ready || saving || autoCopySaving || capturingShortcut || clearingScreenshots}
                     onChange={(shortcut) => change("shortcut", shortcut)}
                     onBusy={setCapturingShortcut}
                     onError={report}
                   />
                   <div className="section-intro separated">
                     <h2>屏幕观察</h2>
-                    <p>仅观察你选择的来源，截图默认不长期保存。</p>
+                    <p>仅观察你选择的来源，可以回看最近互动中的截图。</p>
                   </div>
                   <Field label="屏幕或窗口">
                     <div className="inline-input">
@@ -1653,6 +1668,21 @@ export default function App() {
                       </>
                     )}
                   </div>
+                  <div className="region-settings">
+                    <label className="checkbox-label">
+                      <input type="checkbox" checked={draft.screenshot_history_enabled ?? true}
+                        disabled={!ready || saving || clearingScreenshots}
+                        onChange={(e) => change("screenshot_history_enabled", e.target.checked)} />
+                      保存截图历史
+                    </label>
+                    <p className="field-help">只保存实际读屏使用的压缩截图到本机，最多保留 24 小时或 500 MB，先达到上限就清理较早图片。模型需要回看时才加载图片。</p>
+                    {draft.screenshot_history_enabled === false && <p className="field-help">保存设置后将停止保存，并清空已有截图；文字对话和记忆会保留。</p>}
+                    {confirmClearScreenshots ? <div role="group" aria-label="确认清空截图历史">
+                      <p className="field-help">清空后无法回看这些图片。此操作不会关闭截图保存。</p>
+                      <button type="button" className="text-button" disabled={!ready || saving || clearingScreenshots} onClick={() => void clearScreenshotHistory()}>{clearingScreenshots ? "正在清空…" : "确认清空截图"}</button>
+                      <button type="button" className="text-button" disabled={clearingScreenshots} onClick={() => setConfirmClearScreenshots(false)}>取消</button>
+                    </div> : <button type="button" className="text-button" disabled={!ready || saving || clearingScreenshots} onClick={() => setConfirmClearScreenshots(true)}>清空截图历史</button>}
+                  </div>
                   <div className="field-grid">
                     <Field label="观察间隔">
                       <select
@@ -1699,7 +1729,7 @@ export default function App() {
                 <span role="status">{notice || "设置保存在本机"}</span>
                 <button
                   className="primary-button"
-                  disabled={!ready || saving || autoCopySaving || capturingShortcut}
+                  disabled={!ready || saving || autoCopySaving || capturingShortcut || clearingScreenshots}
                 >
                   {saving ? "正在保存…" : "保存设置"}
                 </button>
