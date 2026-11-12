@@ -121,6 +121,16 @@ impl Store {
             .lock()
             .map_err(|_| "数据库锁失效，请重启应用".into())
     }
+    pub fn last_user_message_time(&self) -> Result<Option<String>> {
+        self.lock()?
+            .query_row(
+                "SELECT created_at FROM messages WHERE role='user' ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(db_error)
+    }
     pub fn messages(&self) -> Result<Vec<Message>> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare("SELECT id,role,content,created_at FROM (SELECT * FROM messages ORDER BY id DESC LIMIT 200) ORDER BY id").map_err(db_error)?;
@@ -722,6 +732,20 @@ fn db_error(error: rusqlite::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn last_user_time_ignores_observations_beyond_context_window() {
+        let db = store();
+        assert_eq!(db.last_user_message_time().unwrap(), None);
+        let user = db.add_message("user", "你好").unwrap();
+        for _ in 0..201 {
+            db.add_message("proactive", "自动观察").unwrap();
+        }
+        assert!(db.messages().unwrap().iter().all(|m| m.role != "user"));
+        assert_eq!(
+            db.last_user_message_time().unwrap().as_deref(),
+            Some(user.created_at.as_str())
+        );
+    }
     fn store() -> Store {
         Store::open(Path::new(":memory:")).unwrap()
     }

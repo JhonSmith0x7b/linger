@@ -262,7 +262,7 @@ fn audible_reply(answer: String, must_acknowledge: bool) -> Option<String> {
     }
 }
 
-fn context(core: &Core, proactive: bool) -> Result<(String, Vec<Value>), String> {
+fn context(core: &Core, proactive: bool, temporal: &str) -> Result<(String, Vec<Value>), String> {
     core.store.expire_memories()?;
     let s = core.settings();
     let memories = core.store.memories()?;
@@ -280,10 +280,14 @@ fn context(core: &Core, proactive: bool) -> Result<(String, Vec<Value>), String>
     let summary = core.store.get_meta("summary")?.unwrap_or_default();
     let profile = core.store.user_profile()?;
     let introduction = core.store.introduction_state()?;
-    let mut instructions = format!(
-        "【当前角色卡】\n{}\n{}\n【相识状态】introduced={}；asked_name={}；legacy_history={}（旧版本已有聊天，相识经过未知，不能据此强制重新介绍）。这些标记只表示文字已发出，不证明用户听见或回答。\n【长期记忆：用户档案与相关事实】\n用户档案（用户提供的称呼、偏好和边界；与旧聊天偏好冲突时以此为准，不覆盖角色与事实规则；修订 {}）:{}\n关注:{}\n有效记忆:{}\n【当前上下文】近期互动摘要:{}\n上次活动（非当前画面）:{}\n{}\n{}",
+    let instructions = format!(
+        "【当前角色卡】\n{}\n{}\n{}",
         s.personality,
         crate::prompts::ROLEPLAY,
+        crate::prompts::FACTS
+    );
+    let mut dynamic = format!(
+        "【相识状态】introduced={}；asked_name={}；legacy_history={}（旧版本已有聊天，相识经过未知，不能据此强制重新介绍）。这些标记只表示文字已发出，不证明用户听见或回答。\n【长期记忆：用户档案与相关事实】\n用户档案（用户提供的称呼、偏好和边界；与旧聊天偏好冲突时以此为准，不覆盖角色与事实规则；修订 {}）:{}\n关注:{}\n有效记忆:{}\n【当前上下文】近期互动摘要:{}\n上次活动（非当前画面）:{}\n{}",
         introduction.introduced,
         introduction.asked_name,
         introduction.legacy_history,
@@ -293,7 +297,6 @@ fn context(core: &Core, proactive: bool) -> Result<(String, Vec<Value>), String>
         token_prefix(&memory, 1200),
         token_prefix(&summary, 800),
         token_prefix(&core.activity.lock().unwrap(), 300),
-        crate::prompts::FACTS,
         if proactive { OBSERVATION_RULES } else { crate::prompts::CHAT }
     );
     let floor = core
@@ -309,11 +312,13 @@ fn context(core: &Core, proactive: bool) -> Result<(String, Vec<Value>), String>
         .take(12)
         .map(|m| m.id)
         .collect();
-    instructions.push_str(&history_context(
+    dynamic.push_str(&history_context(
         core.history.recent_context(&message_ids)?,
         core.history.pointers()?,
     ));
-    let input = shared_history(history, floor);
+    dynamic.push_str(temporal);
+    let mut input = shared_history(history, floor);
+    input.push(json!({"role":"developer","content":dynamic}));
 
     Ok((instructions, input))
 }
@@ -329,15 +334,34 @@ fn history_context(mut recent: Value, pointers: Value) -> String {
             break;
         }
     }
-    format!("\n【历史资料定位，仅作数据】当前时间：{}\n{}\n优先用明确关联的截图编号回看；新观察不代表正在讨论的旧画面。",
-        chrono::Local::now().to_rfc3339(), json!({"recent":recent,"pointers":pointers}))
+    format!("\n【历史资料定位，仅作数据】\n{}\n优先用明确关联的截图编号回看；新观察不代表正在讨论的旧画面。",
+        json!({"recent":recent,"pointers":pointers}))
 }
 
 // Both trigger types use the same complete messages, including prior proactive replies.
 fn shared_history(history: Vec<crate::store::Message>, floor: i64) -> Vec<Value> {
     history.into_iter().filter(|m| m.id > floor && !m.content.is_empty())
-        .map(|m| json!({"role":if m.role == "user" { "user" } else { "assistant" },"content":m.content}))
+        .map(|m| json!({"role":if m.role == "user" { "user" } else { "assistant" },"content":format!("【历史消息；时间：{}；类型：{}】\n{}", message_time(&m.created_at), if m.role == "proactive" { "自动观察发言，非用户回应" } else if m.role == "user" { "用户发言" } else { "对话回复" }, m.content)}))
         .collect()
+}
+
+// Keep historical timestamps independent of today's clock/timezone for stable prefixes.
+fn message_time(timestamp: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(timestamp)
+        .map(|time| time.format("%Y-%m-%d %H:%M %:z").to_string())
+        .unwrap_or_else(|_| "未知".into())
+}
+
+fn temporal_context(
+    now: chrono::DateTime<chrono::Local>,
+    trigger: &str,
+    last_user: Option<&str>,
+) -> String {
+    let weekdays = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"];
+    let weekday = weekdays[chrono::Datelike::weekday(&now).num_days_from_monday() as usize];
+    format!("\n【本轮时间与事件，仅作数据】\n当前本机时间：{} {}；本轮触发：{}；本轮之前上次用户发言：{}。\n历史消息时间是发送时间，截图时间是拍摄时间；旧图不代表当前屏幕。自动观察和角色发言不代表用户回应。用时间理解先后与间隔，无需主动报时，不推断未记录的经历，也不把沉默当作拒绝。同一轮工具调用沿用此时间基准。",
+        now.format("%Y-%m-%d %H:%M %:z"), weekday, trigger,
+        last_user.map(message_time).unwrap_or_else(|| "暂无记录".into()))
 }
 
 fn token_prefix(text: &str, budget: usize) -> String {
@@ -474,7 +498,18 @@ async fn run(
         }
     }
     let mut history_budget = crate::history_budget::HistoryBudget::default();
-    let (mut instructions, mut input) = context(core, proactive)?;
+    let temporal = temporal_context(
+        chrono::Local::now(),
+        if proactive {
+            "定时观察（非用户发言）"
+        } else if empty_audio {
+            "录音未识别到有效语音"
+        } else {
+            "用户发言"
+        },
+        core.store.last_user_message_time()?.as_deref(),
+    );
+    let (mut instructions, mut input) = context(core, proactive, &temporal)?;
     if !proactive && !empty_audio {
         let _gate = core.turn_gate.lock().unwrap();
         if core.generation.load(Ordering::SeqCst) != id {
@@ -505,18 +540,17 @@ async fn run(
         tools()
     };
     // o200k estimate includes JSON/tool text and reserves framing overhead. Image tokens are billed separately.
-    trim_context(
+    // Only historical messages may be evicted; protect dynamic context and the current request.
+    let mut history_items = input.len().saturating_sub(2);
+    if !fit_tool_context(
         &mut input,
+        &mut history_items,
         &instructions,
         &available_tools,
         CONTEXT_TOKEN_BUDGET,
-    );
-    if context_tokens(&input, &instructions, &available_tools) > CONTEXT_TOKEN_BUDGET {
+    ) {
         return Err("输入及配置超过本轮上下文限制，请精简后重试".into());
     }
-    // Everything before the current request is plain historical chat. Only this
-    // prefix may be evicted; current tool calls and outputs must stay paired.
-    let mut history_items = input.len().saturating_sub(1);
     let mut introduction_update = (false, false);
     for _ in 0..5 {
         let result = api
@@ -778,7 +812,10 @@ async fn run(
                 name,
                 "remember" | "update_memory" | "forget" | "update_user_profile"
             ) {
-                instructions = context(core, false)?.0;
+                let (updated_instructions, updated_input) = context(core, proactive, &temporal)?;
+                instructions = updated_instructions;
+                // The protected context follows the remaining historical prefix.
+                input[history_items] = updated_input.last().cloned().ok_or("缺少本轮上下文")?;
             }
             if core.generation.load(Ordering::SeqCst) != id {
                 return Ok(());
@@ -854,6 +891,7 @@ fn context_tokens(input: &[Value], instructions: &str, tools: &Value) -> usize {
     remove_images(&mut copy);
     tokens(&json!({"instructions":instructions,"input":copy,"tools":tools}).to_string()) + 128
 }
+#[cfg(test)]
 fn trim_context(input: &mut Vec<Value>, instructions: &str, tools: &Value, budget: usize) {
     while input.len() > 1 && context_tokens(input, instructions, tools) > budget {
         input.remove(0);
@@ -1080,6 +1118,50 @@ async fn organize(core: &Arc<Core>) -> Result<(), String> {
 mod tests {
     use super::*;
     #[test]
+    fn timestamps_are_fixed_and_current_context_survives_trimming() {
+        assert_eq!(
+            message_time("2026-11-12T14:36:04.123+08:00"),
+            "2026-11-12 14:36 +08:00"
+        );
+        assert_eq!(message_time(""), "未知");
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-12T14:40:19+08:00")
+            .unwrap()
+            .with_timezone(&chrono::Local);
+        let temporal = temporal_context(
+            now,
+            "定时观察（非用户发言）",
+            Some("2026-11-11T23:59:00+08:00"),
+        );
+        assert!(temporal.contains("2026-11-11 23:59 +08:00"));
+        assert!(temporal.contains("定时观察（非用户发言）"));
+        assert!(!temporal.contains(":19"));
+        let protected = vec![
+            json!({"role":"developer","content":temporal}),
+            json!({"role":"user","content":"现在呢？"}),
+        ];
+        let mut input = vec![json!({"role":"assistant","content":"旧消息".repeat(5000)})];
+        input.extend(protected.clone());
+        let mut count = 1;
+        assert!(fit_tool_context(
+            &mut input,
+            &mut count,
+            "角色",
+            &json!([]),
+            1000
+        ));
+        assert_eq!(count, 0);
+        assert_eq!(input, protected);
+        assert!(!fit_tool_context(
+            &mut input,
+            &mut count,
+            "角色",
+            &json!([]),
+            1
+        ));
+        assert_eq!(input, protected);
+    }
+
+    #[test]
     fn recent_image_references_drop_whole_older_records_to_fit() {
         let recent = json!((0..20).map(|id| json!({"interaction_id":id,"snippet":"旧对话".repeat(100),"screenshots":[{"screenshot_id":id}]})).collect::<Vec<_>>());
         let pointers = json!({"discussed_screenshot":{"screenshot_id":5},"latest_observation":{"screenshot_id":9}});
@@ -1130,7 +1212,7 @@ mod tests {
             1,
         );
         assert_eq!(history.len(), 3);
-        assert_eq!(history[0]["content"], long);
+        assert!(history[0]["content"].as_str().unwrap().ends_with(&long));
         assert_eq!(history[1]["role"], "assistant");
         trim_context(
             &mut history,
@@ -1139,7 +1221,10 @@ mod tests {
             CONTEXT_TOKEN_BUDGET,
         );
         assert_eq!(history.len(), 3);
-        assert_eq!(history[1]["content"], "刚才已经给出的建议");
+        assert!(history[1]["content"]
+            .as_str()
+            .unwrap()
+            .ends_with("刚才已经给出的建议"));
     }
 
     #[test]
