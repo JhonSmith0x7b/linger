@@ -32,6 +32,9 @@ fn replay(events: &[Value]) -> (String, thread::JoinHandle<Value>) {
                 Err(error) => panic!("replay accept: {error}"),
             }
         };
+        // Accepted sockets can inherit the listener's nonblocking mode on
+        // macOS. Only accept is polled; request I/O must block with a timeout.
+        stream.set_nonblocking(false).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();

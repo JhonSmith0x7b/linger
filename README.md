@@ -2,7 +2,7 @@
 
 macOS / Windows 桌面 AI 陪伴应用。Tauri 2 + React + Rust + SQLite，聊天与识别采用 OpenAI API，可配置局域网 NewAPI 中转；语音合成另支持阿里云 CosyVoice 和 MiniMax。
 
-当前版本 **0.1.24**，处于实际试用阶段。**已知问题：Windows 悬浮窗的部分按钮在实际使用中仍可能无法点击，尚未修复。** 详情见[已知问题](docs/known-issues.md)。
+当前版本 **0.1.25**，处于实际试用阶段。**已知问题：Windows 悬浮窗的部分按钮在实际使用中仍可能无法点击，尚未修复。** 详情见[已知问题](docs/known-issues.md)。
 
 [下载 Windows 安装包](https://github.com/JhonSmith0x7b/linger/releases/latest) · [构建与发布说明](docs/windows-build.md)
 
@@ -159,3 +159,5 @@ RUSTUP_HOME="$PWD/.cache/rustup" CARGO_HOME="$PWD/.cache/cargo" cargo test --man
 部分 Codex 中转接受但不执行 `max_output_tokens`，因此该参数不是此路径的输出或费用硬上限。本地仍执行 6000 token 文本输入预算。客户端为异常响应设置事件与整轮流量限制，达到限制将报错并停止本地读取，不将截断结果当作成功；这不保证上游立即停止生成或计费。
 
 回归测试包含用户提供的人工对话／JPEG 兼容性实验中脱敏裁剪的 SSE 项目事件；没有真实聊天、截图、Key 或可用 reasoning 密文。离线回放验证协议适配，不等于已在官方或中转账号上重新发起实测；ASR、TTS 和模型列表仍需各自的对应接口支持。
+
+0.1.25 修复 macOS CI 中 SSE 回放测试的 TCP 连接阻塞模式，恢复自动发布；应用功能与 0.1.24 一致。
