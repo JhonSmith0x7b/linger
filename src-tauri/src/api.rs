@@ -1,6 +1,146 @@
 use reqwest::{multipart, Client, Response, Url};
 use serde_json::{json, Value};
-use std::time::Duration;
+use std::{collections::BTreeMap, time::Duration};
+
+// Resource protection for gateways that accept but ignore max_output_tokens.
+// This is a byte ceiling, not a token or billing guarantee.
+const MAX_STREAM_BYTES: usize = 16 * 1024 * 1024;
+const MAX_EVENT_BYTES: usize = 8 * 1024 * 1024;
+const STREAM_LIMIT_ERROR: &str = "模型返回数据超过客户端安全上限，已中止；本次响应不完整，不执行其中的工具调用，请缩小请求后重试";
+
+fn add_stream_bytes(size: &mut usize, extra: usize, limit: usize) -> Result<(), String> {
+    *size = size
+        .checked_add(extra)
+        .filter(|n| *n <= limit)
+        .ok_or(STREAM_LIMIT_ERROR)?;
+    Ok(())
+}
+
+#[derive(Default)]
+struct StreamOutputs {
+    items: BTreeMap<u64, StreamItem>,
+}
+struct StreamItem {
+    id: String,
+    done: Option<Value>,
+}
+impl StreamOutputs {
+    fn collect(&mut self, event: &Value) -> Result<(), String> {
+        let index = event["output_index"]
+            .as_u64()
+            .ok_or("流式输出缺少项目序号")?;
+        let item = &event["item"];
+        let id = item["id"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .ok_or("流式输出缺少项目 ID")?;
+        if !item["type"].is_string() {
+            return Err("流式输出缺少项目类型".into());
+        }
+        if self
+            .items
+            .iter()
+            .any(|(other_index, other)| *other_index != index && other.id == id)
+        {
+            return Err("流式输出项目 ID 与序号冲突".into());
+        }
+        let entry = self.items.entry(index).or_insert_with(|| StreamItem {
+            id: id.into(),
+            done: None,
+        });
+        if entry.id != id {
+            return Err("流式输出项目 ID 与序号冲突".into());
+        }
+        if event["type"] == "response.output_item.done" {
+            if entry.done.as_ref().is_some_and(|done| done != item) {
+                return Err("流式输出重复项目内容不一致".into());
+            }
+            entry.done = Some(item.clone());
+        }
+        Ok(())
+    }
+
+    fn complete(self, mut response: Value, max_output: u32) -> Result<Value, String> {
+        if response["status"] == "incomplete" {
+            return Err(incomplete_response_error(&response, max_output));
+        }
+        if response["status"] != "completed"
+            || response.get("error").is_some_and(|error| !error.is_null())
+        {
+            return Err("模型未成功完成请求，请检查服务状态".into());
+        }
+        let output = response["output"]
+            .as_array()
+            .ok_or("服务未返回 Responses output，请检查中转兼容性")?;
+        if !output.is_empty() {
+            return Ok(response);
+        }
+        // Some Codex gateways omit the final array even though complete item
+        // events were sent. Never synthesize a tool call from partial deltas.
+        if self.items.is_empty() {
+            return Err("模型完成事件缺少完整输出，请检查中转兼容性".into());
+        }
+        let mut completed = Vec::with_capacity(self.items.len());
+        for (expected, (index, item)) in self.items.into_iter().enumerate() {
+            if index != expected as u64 {
+                return Err("流式输出项目不完整，未执行工具".into());
+            }
+            let done = item
+                .done
+                .ok_or("流式输出项目未完成，不执行其中的工具调用")?;
+            validate_complete_item(&done)?;
+            completed.push(done);
+        }
+        response["output"] = Value::Array(completed);
+        Ok(response)
+    }
+}
+
+fn validate_complete_item(item: &Value) -> Result<(), String> {
+    // A done item may be incomplete when a terminal incomplete event follows.
+    // Defer this check until successful fallback finalization to retain the
+    // terminal event's actual failure reason and usage diagnostics.
+    if item
+        .get("status")
+        .is_some_and(|status| !status.is_null() && status != "completed")
+    {
+        return Err("流式输出项目尚未完整生成，不执行其中的工具调用".into());
+    }
+    match item["type"].as_str() {
+        Some("function_call") => {
+            if ["name", "call_id"].iter().any(|key| {
+                item[*key]
+                    .as_str()
+                    .is_none_or(|value| value.trim().is_empty())
+            }) {
+                return Err("工具调用缺少名称或调用 ID，不执行本次调用".into());
+            }
+            let arguments = item["arguments"]
+                .as_str()
+                .ok_or("工具调用缺少完整参数，不执行本次调用")?;
+            let arguments: Value = serde_json::from_str(arguments)
+                .map_err(|_| "工具调用参数不是完整 JSON，不执行本次调用")?;
+            if !arguments.is_object() {
+                return Err("工具调用参数必须为 JSON 对象，不执行本次调用".into());
+            }
+        }
+        Some("message") => {
+            let parts = item["content"]
+                .as_array()
+                .filter(|parts| !parts.is_empty())
+                .ok_or("模型消息缺少完整内容")?;
+            for part in parts {
+                match part["type"].as_str() {
+                    Some("output_text") if part["text"].is_string() => {}
+                    Some("refusal") if part["refusal"].is_string() => {}
+                    _ => return Err("模型消息内容不完整或格式不受支持".into()),
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
 
 /// OpenAI protocol client. The configured base URL includes `/v1` (or a proxy prefix).
 /// Dropping an in-flight future cancels local consumption; callers still discard late turns.
@@ -118,28 +258,11 @@ impl Api {
         tools: Value,
         max_output: u32,
     ) -> Result<Value, String> {
-        let body = json!({
-            "model": model, "instructions": instructions, "input": input,
-            "tools": tools, "max_output_tokens": max_output, "store": false,
-            "include": ["reasoning.encrypted_content"]
-        });
-        let response = self
-            .checked(self.post("responses").json(&body).send().await)
-            .await?;
-        let value: Value = response
-            .json()
+        self.response_stream(model, instructions, input, tools, max_output, |_| {})
             .await
-            .map_err(|_| "对话接口返回了无法解析的 JSON".to_string())?;
-        if value["status"] == "failed" || value.get("error").is_some_and(|e| !e.is_null()) {
-            return Err("模型未完成请求，请检查所选模型与服务状态".into());
-        }
-        if !value["output"].is_array() {
-            return Err("服务未返回 Responses output，请检查中转兼容性".into());
-        }
-        Ok(value)
     }
 
-    /// Text deltas are provisional; the completed object remains authoritative for tool calls.
+    /// Deltas are provisional. Tools are released only after successful completion.
     pub async fn response_stream<F: FnMut(&str) + Send>(
         &self,
         model: &str,
@@ -157,15 +280,16 @@ impl Api {
             .await?;
         let mut pending = Vec::new();
         let mut data_lines = Vec::<String>::new();
+        let mut event_bytes = 0usize;
+        let mut total_bytes = 0usize;
+        let mut outputs = StreamOutputs::default();
         while let Some(chunk) = response
             .chunk()
             .await
             .map_err(|_| "对话流传输中断".to_string())?
         {
+            add_stream_bytes(&mut total_bytes, chunk.len(), MAX_STREAM_BYTES)?;
             pending.extend_from_slice(&chunk);
-            if pending.len() > 8 * 1024 * 1024 {
-                return Err("对话事件超出大小限制".into());
-            }
             while let Some(end) = pending.iter().position(|b| *b == b'\n') {
                 let line_bytes: Vec<u8> = pending.drain(..=end).collect();
                 let line = std::str::from_utf8(&line_bytes)
@@ -177,6 +301,7 @@ impl Api {
                     }
                     let data = data_lines.join("\n");
                     data_lines.clear();
+                    event_bytes = 0;
                     if data == "[DONE]" {
                         continue;
                     }
@@ -188,7 +313,12 @@ impl Api {
                                 on_delta(delta);
                             }
                         }
-                        "response.completed" => return Ok(event["response"].clone()),
+                        "response.output_item.added" | "response.output_item.done" => {
+                            outputs.collect(&event)?;
+                        }
+                        "response.completed" => {
+                            return outputs.complete(event["response"].clone(), max_output);
+                        }
                         "response.incomplete" => {
                             return Err(incomplete_response_error(&event["response"], max_output))
                         }
@@ -198,8 +328,12 @@ impl Api {
                         _ => {}
                     }
                 } else if let Some(data) = line.strip_prefix("data:") {
+                    add_stream_bytes(&mut event_bytes, data.len() + 1, MAX_EVENT_BYTES)?;
                     data_lines.push(data.strip_prefix(' ').unwrap_or(data).to_owned());
                 }
+            }
+            if pending.len() > MAX_EVENT_BYTES {
+                return Err(STREAM_LIMIT_ERROR.into());
             }
         }
         Err("对话流提前结束，未收到完成事件".into())
@@ -368,6 +502,15 @@ mod tests {
         (format!("http://{address}/proxy/v1"), handle)
     }
 
+    fn response_sse(response: Value) -> Vec<u8> {
+        let kind = if response["status"] == "incomplete" {
+            "response.incomplete"
+        } else {
+            "response.completed"
+        };
+        format!("data: {}\n\n", json!({"type":kind,"response":response})).into_bytes()
+    }
+
     fn request_body(request: &str) -> Value {
         serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap()
     }
@@ -437,12 +580,7 @@ mod tests {
     #[tokio::test]
     async fn responses_preserve_tool_call_ids_and_disable_storage() {
         let response = json!({"status":"completed","output":[{"type":"function_call","call_id":"call_123","name":"capture","arguments":"{}"}]});
-        let (url, server) = mock(
-            "200 OK",
-            "application/json",
-            response.to_string().into_bytes(),
-            false,
-        );
+        let (url, server) = mock("200 OK", "text/event-stream", response_sse(response), false);
         let api = Api::new(&url, "fake-key").unwrap();
         let input =
             json!([{"type":"function_call_output","call_id":"previous_call","output":"saved"}]);
@@ -458,6 +596,7 @@ mod tests {
             .contains("authorization: bearer fake-key"));
         let body = request_body(&request);
         assert_eq!(body["store"], false);
+        assert_eq!(body["stream"], true);
         assert_eq!(body["input"], input);
         assert_eq!(body["max_output_tokens"], 500);
     }
@@ -507,12 +646,7 @@ mod tests {
     #[tokio::test]
     async fn translation_uses_own_model_without_tools_or_conversation() {
         let body = json!({"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"Hello"}]}]});
-        let (url, server) = mock(
-            "200 OK",
-            "application/json",
-            body.to_string().into_bytes(),
-            false,
-        );
+        let (url, server) = mock("200 OK", "text/event-stream", response_sse(body), false);
         let result = Api::new(&url, "fake-key")
             .unwrap()
             .translate("translation-model", "英语", "你好", "casual", "")
@@ -524,6 +658,7 @@ mod tests {
         assert_eq!(sent["model"], "translation-model");
         assert_eq!(sent["tools"], json!([]));
         assert_eq!(sent["store"], false);
+        assert_eq!(sent["stream"], true);
         assert_eq!(sent["input"].as_array().unwrap().len(), 1);
         let content: Value =
             serde_json::from_str(sent["input"][0]["content"].as_str().unwrap()).unwrap();
@@ -542,12 +677,7 @@ mod tests {
             .await
             .is_err());
         let body = json!({"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[{"type":"message","content":[{"type":"output_text","text":"partial"}]}]});
-        let (url, server) = mock(
-            "200 OK",
-            "application/json",
-            body.to_string().into_bytes(),
-            false,
-        );
+        let (url, server) = mock("200 OK", "text/event-stream", response_sse(body), false);
         assert!(Api::new(&url, "fake-key")
             .unwrap()
             .translate("m", "英语", "你好", "casual", "")
@@ -565,12 +695,7 @@ mod tests {
             ("custom", "  像游戏队友聊天  ", "像游戏队友聊天"),
         ] {
             let body = json!({"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"Hi"}]}]});
-            let (url, server) = mock(
-                "200 OK",
-                "application/json",
-                body.to_string().into_bytes(),
-                false,
-            );
+            let (url, server) = mock("200 OK", "text/event-stream", response_sse(body), false);
             Api::new(&url, "fake-key")
                 .unwrap()
                 .translate("m", "英语", "你好", style, custom)
@@ -631,7 +756,7 @@ mod tests {
         let stream=concat!(
             "event: response.output_text.delta\r\n",
             "data: {\"type\":\"response.output_text.delta\",\"delta\":\"你好\"}\r\n\r\n",
-            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\r\n\r\n");
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"你好\"}]}]}}\r\n\r\n");
         let (url, server) = mock(
             "200 OK",
             "text/event-stream",
@@ -689,5 +814,188 @@ mod tests {
             .await
             .is_err());
         server.join().unwrap();
+    }
+
+    fn item_event(index: u64, kind: &str, item: Value) -> Value {
+        json!({"type":kind,"output_index":index,"item":item})
+    }
+
+    #[test]
+    fn completed_output_is_authoritative_and_preserves_metadata() {
+        let mut outputs = StreamOutputs::default();
+        outputs
+            .collect(&item_event(
+                0,
+                "response.output_item.added",
+                json!({"id":"m1","type":"message"}),
+            ))
+            .unwrap();
+        let response = json!({"status":"completed","usage":{"output_tokens":5},"output":[{"id":"m1","type":"message","content":[{"type":"output_text","text":"complete"}]}]});
+        assert_eq!(outputs.complete(response.clone(), 10).unwrap(), response);
+    }
+
+    #[test]
+    fn empty_completed_recovers_ordered_whole_items_without_duplicate_content() {
+        let reasoning = json!({"id":"r1","type":"reasoning","summary":[],"encrypted_content":"opaque-test-value"});
+        let call = json!({"id":"f1","type":"function_call","status":"completed","call_id":"call1","name":"capture","arguments":"{}"});
+        let message = json!({"id":"m1","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"result","annotations":[{"type":"url_citation","url":"https://example.com","title":"test","start_index":0,"end_index":6}]}]});
+        let mut outputs = StreamOutputs::default();
+        for (index, item) in [
+            (2, message.clone()),
+            (0, reasoning.clone()),
+            (1, call.clone()),
+            (1, call.clone()),
+        ] {
+            outputs
+                .collect(&item_event(index, "response.output_item.done", item))
+                .unwrap();
+        }
+        // Late added replay cannot overwrite a completed item.
+        outputs
+            .collect(&item_event(
+                1,
+                "response.output_item.added",
+                json!({"id":"f1","type":"function_call","arguments":""}),
+            ))
+            .unwrap();
+        let result = outputs
+            .complete(
+                json!({"status":"completed","output":[],"usage":{"output_tokens":22}}),
+                50,
+            )
+            .unwrap();
+        assert_eq!(result["output"], json!([reasoning, call, message]));
+        assert_eq!(result["usage"]["output_tokens"], 22);
+    }
+
+    #[test]
+    fn missing_or_conflicting_items_never_become_success() {
+        let call = json!({"id":"f1","type":"function_call","status":"completed","call_id":"call1","name":"capture","arguments":"{}"});
+        for (index, kind) in [
+            (0, "response.output_item.added"),
+            (1, "response.output_item.done"),
+        ] {
+            let mut outputs = StreamOutputs::default();
+            outputs
+                .collect(&item_event(index, kind, call.clone()))
+                .unwrap();
+            assert!(outputs
+                .complete(json!({"status":"completed","output":[]}), 50)
+                .is_err());
+        }
+        let mut outputs = StreamOutputs::default();
+        outputs
+            .collect(&item_event(0, "response.output_item.done", call.clone()))
+            .unwrap();
+        assert!(outputs
+            .collect(&item_event(1, "response.output_item.done", call.clone()))
+            .is_err());
+        let mut changed = call;
+        changed["arguments"] = json!("{\"changed\":true}");
+        assert!(outputs
+            .collect(&item_event(0, "response.output_item.done", changed))
+            .is_err());
+        assert!(StreamOutputs::default()
+            .complete(json!({"status":"completed","output":[]}), 50)
+            .is_err());
+    }
+
+    #[test]
+    fn completed_event_does_not_override_response_failure() {
+        for status in ["incomplete", "failed", "in_progress"] {
+            assert!(StreamOutputs::default()
+                .complete(json!({"status":status,"output":[{"type":"message"}]}), 50)
+                .is_err());
+        }
+        assert!(StreamOutputs::default().complete(json!({"status":"completed","error":{"message":"failure"},"output":[{"type":"message"}]}), 50).is_err());
+    }
+
+    #[test]
+    fn stream_byte_limits_include_cumulative_events_and_overflow() {
+        let mut bytes = 0;
+        add_stream_bytes(&mut bytes, 6, 10).unwrap();
+        add_stream_bytes(&mut bytes, 4, 10).unwrap();
+        assert!(add_stream_bytes(&mut bytes, 1, 10)
+            .unwrap_err()
+            .contains("客户端安全上限"));
+        let mut bytes = usize::MAX;
+        assert!(add_stream_bytes(&mut bytes, 1, usize::MAX).is_err());
+    }
+
+    #[tokio::test]
+    async fn completed_items_are_not_returned_on_failure_or_early_disconnect() {
+        for terminal in [
+            None,
+            Some("response.failed"),
+            Some("error"),
+            Some("response.incomplete"),
+        ] {
+            let mut events = format!(
+                "data: {}\n\n",
+                item_event(
+                    0,
+                    "response.output_item.done",
+                    json!({"id":"f1","type":"function_call","status":"completed","call_id":"call1","name":"remember","arguments":"{}"})
+                )
+            );
+            if let Some(kind) = terminal {
+                events.push_str(&format!(
+                    "data: {}\n\n",
+                    json!({"type":kind,"response":{"status":"incomplete"}})
+                ));
+            }
+            let (url, server) = mock("200 OK", "text/event-stream", events.into_bytes(), false);
+            assert!(Api::new(&url, "fake-key")
+                .unwrap()
+                .response("m", "", json!([]), json!([]), 100)
+                .await
+                .is_err());
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn fallback_rejects_incomplete_function_arguments_and_messages() {
+        for item in [
+            json!({"type":"function_call","name":"capture","call_id":"c1"}),
+            json!({"type":"function_call","name":"capture","call_id":"c1","arguments":"{"}),
+            json!({"type":"function_call","name":"capture","call_id":"c1","arguments":"[]"}),
+            json!({"type":"function_call","arguments":"{}"}),
+            json!({"type":"message","content":[]}),
+            json!({"type":"message","content":[{"type":"output_text"}]}),
+        ] {
+            assert!(validate_complete_item(&item).is_err());
+        }
+        assert!(validate_complete_item(
+            &json!({"type":"message","content":[{"type":"refusal","refusal":"cannot answer"}]})
+        )
+        .is_ok());
+    }
+
+    #[tokio::test]
+    async fn incomplete_item_keeps_terminal_failure_reason_and_usage() {
+        let item = json!({"id":"f1","type":"function_call","status":"incomplete","call_id":"call1","name":"remember","arguments":"{"});
+        let response = json!({"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"usage":{"output_tokens_details":{"reasoning_tokens":500}},"output":[item.clone()]});
+        let events = format!(
+            "data: {}\n\ndata: {}\n\n",
+            item_event(0, "response.output_item.done", item.clone()),
+            json!({"type":"response.incomplete","response":response})
+        );
+        let (url, server) = mock("200 OK", "text/event-stream", events.into_bytes(), false);
+        let error = Api::new(&url, "fake-key")
+            .unwrap()
+            .response("m", "", json!([]), json!([]), 2048)
+            .await
+            .unwrap_err();
+        server.join().unwrap();
+        assert!(error.contains("2048"));
+        assert!(error.contains("推理使用 500 tokens"));
+        let mut outputs = StreamOutputs::default();
+        outputs
+            .collect(&item_event(0, "response.output_item.done", item))
+            .unwrap();
+        assert!(outputs
+            .complete(json!({"status":"completed","output":[]}), 2048)
+            .is_err());
     }
 }

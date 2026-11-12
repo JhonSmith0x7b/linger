@@ -1,0 +1,2364 @@
+[
+  {
+    "name": "gpt-6-astra/01_full_parameters",
+    "events": [
+      {
+        "type": "response.output_item.added",
+        "output_index": 0,
+        "item": {
+          "type": "message",
+          "id": "test_item_0",
+          "role": "assistant",
+          "status": "in_progress",
+          "content": [],
+          "phase": "final_answer"
+        }
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "测试"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "成功"
+      },
+      {
+        "type": "response.output_item.done",
+        "output_index": 0,
+        "item": {
+          "type": "message",
+          "id": "test_item_0",
+          "role": "assistant",
+          "status": "completed",
+          "content": [
+            {
+              "type": "output_text",
+              "text": "测试成功",
+              "annotations": [],
+              "logprobs": []
+            }
+          ],
+          "phase": "final_answer"
+        }
+      },
+      {
+        "type": "response.completed",
+        "response": {
+          "status": "completed",
+          "output": [
+            {
+              "type": "message",
+              "id": "test_item_0",
+              "role": "assistant",
+              "status": "completed",
+              "content": [
+                {
+                  "type": "output_text",
+                  "text": "测试成功",
+                  "annotations": [],
+                  "logprobs": []
+                }
+              ],
+              "phase": "final_answer"
+            }
+          ],
+          "usage": {
+            "input_tokens": 17,
+            "output_tokens": 6,
+            "total_tokens": 23
+          }
+        }
+      }
+    ]
+  },
+  {
+    "name": "gpt-6-astra/05_search_greeting",
+    "events": [
+      {
+        "type": "response.output_item.added",
+        "output_index": 0,
+        "item": {
+          "id": "test_item_0",
+          "type": "message",
+          "status": "in_progress",
+          "content": [],
+          "phase": "final_answer",
+          "role": "assistant"
+        }
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "你好"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "！"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "有什么"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "我"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "可以"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "帮"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "你"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "的吗"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "？"
+      },
+      {
+        "type": "response.output_item.done",
+        "output_index": 0,
+        "item": {
+          "id": "test_item_0",
+          "type": "message",
+          "status": "completed",
+          "content": [
+            {
+              "type": "output_text",
+              "annotations": [],
+              "logprobs": [],
+              "text": "你好！有什么我可以帮你的吗？"
+            }
+          ],
+          "phase": "final_answer",
+          "role": "assistant"
+        }
+      },
+      {
+        "type": "response.completed",
+        "response": {
+          "status": "completed",
+          "output": [],
+          "usage": {
+            "input_tokens": 4460,
+            "output_tokens": 13,
+            "total_tokens": 4473
+          }
+        }
+      }
+    ]
+  },
+  {
+    "name": "gpt-6-astra/05_search_active",
+    "events": [
+      {
+        "type": "response.output_item.added",
+        "output_index": 0,
+        "item": {
+          "id": "test_item_0",
+          "type": "web_search_call",
+          "status": "in_progress"
+        }
+      },
+      {
+        "type": "response.output_item.done",
+        "output_index": 0,
+        "item": {
+          "id": "test_item_0",
+          "type": "web_search_call",
+          "status": "completed",
+          "action": {
+            "type": "open_page",
+            "url": "https://blog.python.org/"
+          }
+        }
+      },
+      {
+        "type": "response.output_item.added",
+        "output_index": 1,
+        "item": {
+          "id": "test_item_1",
+          "type": "message",
+          "status": "in_progress",
+          "content": [],
+          "phase": "final_answer",
+          "role": "assistant"
+        }
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_1",
+        "output_index": 1,
+        "content_index": 0,
+        "delta": "Python 官方博客最新发布公告为 **"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_1",
+        "output_index": 1,
+        "content_index": 0,
+        "delta": "《"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_1",
+        "output_index": 1,
+        "content_index": 0,
+        "delta": "Python 3.16.0 alpha 2 is now available》**，"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_1",
+        "output_index": 1,
+        "content_index": 0,
+        "delta": "发布日期"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_1",
+        "output_index": 1,
+        "content_index": 0,
+        "delta": "为 **2026 年 11 月 10 日**。"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_1",
+        "output_index": 1,
+        "content_index": 0,
+        "delta": "([blog.python.org](https://blog.python.org/))"
+      },
+      {
+        "type": "response.output_item.done",
+        "output_index": 1,
+        "item": {
+          "id": "test_item_1",
+          "type": "message",
+          "status": "completed",
+          "content": [
+            {
+              "type": "output_text",
+              "annotations": [
+                {
+                  "type": "url_citation",
+                  "end_index": 136,
+                  "start_index": 91,
+                  "title": "Python Insider",
+                  "url": "https://blog.python.org/"
+                }
+              ],
+              "logprobs": [],
+              "text": "Python 官方博客最新发布公告为 **《Python 3.16.0 alpha 2 is now available》**，发布日期为 **2026 年 11 月 10 日**。([blog.python.org](https://blog.python.org/))"
+            }
+          ],
+          "phase": "final_answer",
+          "role": "assistant"
+        }
+      },
+      {
+        "type": "response.completed",
+        "response": {
+          "status": "completed",
+          "output": [],
+          "usage": {
+            "input_tokens": 5561,
+            "output_tokens": 87,
+            "total_tokens": 5648
+          }
+        }
+      }
+    ]
+  },
+  {
+    "name": "gpt-6-astra/05_mixed_first",
+    "events": [
+      {
+        "type": "response.output_item.added",
+        "output_index": 0,
+        "item": {
+          "id": "test_item_0",
+          "type": "function_call",
+          "status": "in_progress",
+          "arguments": "",
+          "call_id": "test_item_1",
+          "name": "get_test_value"
+        }
+      },
+      {
+        "type": "response.output_item.done",
+        "output_index": 0,
+        "item": {
+          "id": "test_item_0",
+          "type": "function_call",
+          "status": "completed",
+          "arguments": "{\"id\":\"sample\"}",
+          "call_id": "test_item_1",
+          "name": "get_test_value"
+        }
+      },
+      {
+        "type": "response.completed",
+        "response": {
+          "status": "completed",
+          "output": [],
+          "usage": {
+            "input_tokens": 4526,
+            "output_tokens": 19,
+            "total_tokens": 4545
+          }
+        }
+      }
+    ]
+  },
+  {
+    "name": "gpt-6-astra/05_mixed_diagnostic_reconstructed_second",
+    "events": [
+      {
+        "type": "response.output_item.added",
+        "output_index": 0,
+        "item": {
+          "id": "test_item_0",
+          "type": "message",
+          "status": "in_progress",
+          "content": [],
+          "phase": "final_answer",
+          "role": "assistant"
+        }
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "TO"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "OL"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "_B"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "041"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "40"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "E"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "86"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "F"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "36"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "BF"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "21"
+      },
+      {
+        "type": "response.output_item.done",
+        "output_index": 0,
+        "item": {
+          "id": "test_item_0",
+          "type": "message",
+          "status": "completed",
+          "content": [
+            {
+              "type": "output_text",
+              "annotations": [],
+              "logprobs": [],
+              "text": "TOOL_B04140E86F36BF21"
+            }
+          ],
+          "phase": "final_answer",
+          "role": "assistant"
+        }
+      },
+      {
+        "type": "response.completed",
+        "response": {
+          "status": "completed",
+          "output": [],
+          "usage": {
+            "input_tokens": 4573,
+            "output_tokens": 15,
+            "total_tokens": 4588
+          }
+        }
+      }
+    ]
+  },
+  {
+    "name": "gpt-6-astra/09_reasoning_function_first",
+    "events": [
+      {
+        "type": "response.output_item.added",
+        "output_index": 0,
+        "item": {
+          "type": "reasoning",
+          "id": "test_item_0",
+          "summary": [],
+          "content": [],
+          "encrypted_content": "opaque-encrypted-test-placeholder"
+        }
+      },
+      {
+        "type": "response.output_item.done",
+        "output_index": 0,
+        "item": {
+          "type": "reasoning",
+          "id": "test_item_0",
+          "summary": [],
+          "content": [],
+          "encrypted_content": "opaque-encrypted-test-placeholder"
+        }
+      },
+      {
+        "type": "response.output_item.added",
+        "output_index": 1,
+        "item": {
+          "type": "function_call",
+          "id": "test_item_1",
+          "call_id": "test_item_2",
+          "name": "get_test_value",
+          "arguments": "",
+          "status": "in_progress"
+        }
+      },
+      {
+        "type": "response.output_item.done",
+        "output_index": 1,
+        "item": {
+          "type": "function_call",
+          "id": "test_item_1",
+          "call_id": "test_item_2",
+          "name": "get_test_value",
+          "arguments": "{\"id\":\"sample\"}",
+          "status": "completed"
+        }
+      },
+      {
+        "type": "response.completed",
+        "response": {
+          "status": "completed",
+          "output": [
+            {
+              "type": "reasoning",
+              "id": "test_item_0",
+              "summary": [],
+              "content": [],
+              "encrypted_content": "opaque-encrypted-test-placeholder"
+            },
+            {
+              "type": "function_call",
+              "id": "test_item_1",
+              "call_id": "test_item_2",
+              "name": "get_test_value",
+              "arguments": "{\"id\":\"sample\"}",
+              "status": "completed"
+            }
+          ],
+          "usage": {
+            "input_tokens": 90,
+            "output_tokens": 34,
+            "total_tokens": 124
+          }
+        }
+      }
+    ]
+  },
+  {
+    "name": "gpt-6-astra/07_json_1",
+    "events": [
+      {
+        "type": "response.output_item.added",
+        "output_index": 0,
+        "item": {
+          "type": "message",
+          "id": "test_item_0",
+          "role": "assistant",
+          "status": "in_progress",
+          "content": [],
+          "phase": "final_answer"
+        }
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "{\""
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "speech"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "\":\""
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "你好"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "\",\""
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "state"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "\":\""
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "正在"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "测试"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "\"}"
+      },
+      {
+        "type": "response.output_item.done",
+        "output_index": 0,
+        "item": {
+          "type": "message",
+          "id": "test_item_0",
+          "role": "assistant",
+          "status": "completed",
+          "content": [
+            {
+              "type": "output_text",
+              "text": "{\"speech\":\"你好\",\"state\":\"正在测试\"}",
+              "annotations": [],
+              "logprobs": []
+            }
+          ],
+          "phase": "final_answer"
+        }
+      },
+      {
+        "type": "response.completed",
+        "response": {
+          "status": "completed",
+          "output": [
+            {
+              "type": "message",
+              "id": "test_item_0",
+              "role": "assistant",
+              "status": "completed",
+              "content": [
+                {
+                  "type": "output_text",
+                  "text": "{\"speech\":\"你好\",\"state\":\"正在测试\"}",
+                  "annotations": [],
+                  "logprobs": []
+                }
+              ],
+              "phase": "final_answer"
+            }
+          ],
+          "usage": {
+            "input_tokens": 34,
+            "output_tokens": 14,
+            "total_tokens": 48
+          }
+        }
+      }
+    ]
+  },
+  {
+    "name": "gpt-6.1-sol/01_full_parameters",
+    "events": [
+      {
+        "type": "response.output_item.added",
+        "output_index": 0,
+        "item": {
+          "type": "message",
+          "id": "test_item_0",
+          "role": "assistant",
+          "status": "in_progress",
+          "content": [],
+          "phase": "final_answer"
+        }
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "测试"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "成功"
+      },
+      {
+        "type": "response.output_item.done",
+        "output_index": 0,
+        "item": {
+          "type": "message",
+          "id": "test_item_0",
+          "role": "assistant",
+          "status": "completed",
+          "content": [
+            {
+              "type": "output_text",
+              "text": "测试成功",
+              "annotations": [],
+              "logprobs": []
+            }
+          ],
+          "phase": "final_answer"
+        }
+      },
+      {
+        "type": "response.completed",
+        "response": {
+          "status": "completed",
+          "output": [
+            {
+              "type": "message",
+              "id": "test_item_0",
+              "role": "assistant",
+              "status": "completed",
+              "content": [
+                {
+                  "type": "output_text",
+                  "text": "测试成功",
+                  "annotations": [],
+                  "logprobs": []
+                }
+              ],
+              "phase": "final_answer"
+            }
+          ],
+          "usage": {
+            "input_tokens": 17,
+            "output_tokens": 6,
+            "total_tokens": 23
+          }
+        }
+      }
+    ]
+  },
+  {
+    "name": "gpt-6.1-sol/05_search_greeting",
+    "events": [
+      {
+        "type": "response.output_item.added",
+        "output_index": 0,
+        "item": {
+          "id": "test_item_0",
+          "type": "message",
+          "status": "in_progress",
+          "content": [],
+          "phase": "final_answer",
+          "role": "assistant"
+        }
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "你好"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "！"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "有什么"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "我"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "可以"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "帮"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "你"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "的吗"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "？"
+      },
+      {
+        "type": "response.output_item.done",
+        "output_index": 0,
+        "item": {
+          "id": "test_item_0",
+          "type": "message",
+          "status": "completed",
+          "content": [
+            {
+              "type": "output_text",
+              "annotations": [],
+              "logprobs": [],
+              "text": "你好！有什么我可以帮你的吗？"
+            }
+          ],
+          "phase": "final_answer",
+          "role": "assistant"
+        }
+      },
+      {
+        "type": "response.completed",
+        "response": {
+          "status": "completed",
+          "output": [],
+          "usage": {
+            "input_tokens": 4460,
+            "output_tokens": 13,
+            "total_tokens": 4473
+          }
+        }
+      }
+    ]
+  },
+  {
+    "name": "gpt-6.1-sol/05_search_active",
+    "events": [
+      {
+        "type": "response.output_item.added",
+        "output_index": 0,
+        "item": {
+          "id": "test_item_0",
+          "type": "web_search_call",
+          "status": "in_progress"
+        }
+      },
+      {
+        "type": "response.output_item.done",
+        "output_index": 0,
+        "item": {
+          "id": "test_item_0",
+          "type": "web_search_call",
+          "status": "completed",
+          "action": {
+            "type": "search",
+            "queries": [
+              "site:blog.python.org latest Python release"
+            ],
+            "query": "site:blog.python.org latest Python release"
+          }
+        }
+      },
+      {
+        "type": "response.output_item.added",
+        "output_index": 1,
+        "item": {
+          "id": "test_item_1",
+          "type": "message",
+          "status": "in_progress",
+          "content": [],
+          "phase": "final_answer",
+          "role": "assistant"
+        }
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_1",
+        "output_index": 1,
+        "content_index": 0,
+        "delta": "Python 官方博客最新发布公告为"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_1",
+        "output_index": 1,
+        "content_index": 0,
+        "delta": " **"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_1",
+        "output_index": 1,
+        "content_index": 0,
+        "delta": "《Python 3.16.0 alpha 2 is now available》"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_1",
+        "output_index": 1,
+        "content_index": 0,
+        "delta": "**，发布日期是"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_1",
+        "output_index": 1,
+        "content_index": 0,
+        "delta": " **2026 年"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_1",
+        "output_index": 1,
+        "content_index": 0,
+        "delta": " 11 月 10"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_1",
+        "output_index": 1,
+        "content_index": 0,
+        "delta": " 日**。"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_1",
+        "output_index": 1,
+        "content_index": 0,
+        "delta": "([blog.python.org](https://blog.python.org/)"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_1",
+        "output_index": 1,
+        "content_index": 0,
+        "delta": ")"
+      },
+      {
+        "type": "response.output_item.done",
+        "output_index": 1,
+        "item": {
+          "id": "test_item_1",
+          "type": "message",
+          "status": "completed",
+          "content": [
+            {
+              "type": "output_text",
+              "annotations": [
+                {
+                  "type": "url_citation",
+                  "end_index": 136,
+                  "start_index": 91,
+                  "title": "Python Insider",
+                  "url": "https://blog.python.org/"
+                }
+              ],
+              "logprobs": [],
+              "text": "Python 官方博客最新发布公告为 **《Python 3.16.0 alpha 2 is now available》**，发布日期是 **2026 年 11 月 10 日**。([blog.python.org](https://blog.python.org/))"
+            }
+          ],
+          "phase": "final_answer",
+          "role": "assistant"
+        }
+      },
+      {
+        "type": "response.completed",
+        "response": {
+          "status": "completed",
+          "output": [],
+          "usage": {
+            "input_tokens": 12758,
+            "output_tokens": 111,
+            "total_tokens": 12869
+          }
+        }
+      }
+    ]
+  },
+  {
+    "name": "gpt-6.1-sol/05_mixed_first",
+    "events": [
+      {
+        "type": "response.output_item.added",
+        "output_index": 0,
+        "item": {
+          "id": "test_item_0",
+          "type": "function_call",
+          "status": "in_progress",
+          "arguments": "",
+          "call_id": "test_item_1",
+          "name": "get_test_value"
+        }
+      },
+      {
+        "type": "response.output_item.done",
+        "output_index": 0,
+        "item": {
+          "id": "test_item_0",
+          "type": "function_call",
+          "status": "completed",
+          "arguments": "{\"id\":\"sample\"}",
+          "call_id": "test_item_1",
+          "name": "get_test_value"
+        }
+      },
+      {
+        "type": "response.completed",
+        "response": {
+          "status": "completed",
+          "output": [],
+          "usage": {
+            "input_tokens": 4526,
+            "output_tokens": 19,
+            "total_tokens": 4545
+          }
+        }
+      }
+    ]
+  },
+  {
+    "name": "gpt-6.1-sol/05_mixed_diagnostic_reconstructed_second",
+    "events": [
+      {
+        "type": "response.output_item.added",
+        "output_index": 0,
+        "item": {
+          "id": "test_item_0",
+          "type": "message",
+          "status": "in_progress",
+          "content": [],
+          "phase": "final_answer",
+          "role": "assistant"
+        }
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "TO"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "OL"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "_D"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "4"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "F"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "073"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "494"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "254"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "1"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "F"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "4"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "B"
+      },
+      {
+        "type": "response.output_item.done",
+        "output_index": 0,
+        "item": {
+          "id": "test_item_0",
+          "type": "message",
+          "status": "completed",
+          "content": [
+            {
+              "type": "output_text",
+              "annotations": [],
+              "logprobs": [],
+              "text": "TOOL_D4F0734942541F4B"
+            }
+          ],
+          "phase": "final_answer",
+          "role": "assistant"
+        }
+      },
+      {
+        "type": "response.completed",
+        "response": {
+          "status": "completed",
+          "output": [],
+          "usage": {
+            "input_tokens": 4574,
+            "output_tokens": 16,
+            "total_tokens": 4590
+          }
+        }
+      }
+    ]
+  },
+  {
+    "name": "gpt-6.1-sol/09_reasoning_function_first",
+    "events": [
+      {
+        "type": "response.output_item.added",
+        "output_index": 0,
+        "item": {
+          "type": "reasoning",
+          "id": "test_item_0",
+          "summary": [],
+          "content": [],
+          "encrypted_content": "opaque-encrypted-test-placeholder"
+        }
+      },
+      {
+        "type": "response.output_item.done",
+        "output_index": 0,
+        "item": {
+          "type": "reasoning",
+          "id": "test_item_0",
+          "summary": [],
+          "content": [],
+          "encrypted_content": "opaque-encrypted-test-placeholder"
+        }
+      },
+      {
+        "type": "response.output_item.added",
+        "output_index": 1,
+        "item": {
+          "type": "function_call",
+          "id": "test_item_1",
+          "call_id": "test_item_2",
+          "name": "get_test_value",
+          "arguments": "",
+          "status": "in_progress"
+        }
+      },
+      {
+        "type": "response.output_item.done",
+        "output_index": 1,
+        "item": {
+          "type": "function_call",
+          "id": "test_item_1",
+          "call_id": "test_item_2",
+          "name": "get_test_value",
+          "arguments": "{\"id\":\"sample\"}",
+          "status": "completed"
+        }
+      },
+      {
+        "type": "response.completed",
+        "response": {
+          "status": "completed",
+          "output": [
+            {
+              "type": "reasoning",
+              "id": "test_item_0",
+              "summary": [],
+              "content": [],
+              "encrypted_content": "opaque-encrypted-test-placeholder"
+            },
+            {
+              "type": "function_call",
+              "id": "test_item_1",
+              "call_id": "test_item_2",
+              "name": "get_test_value",
+              "arguments": "{\"id\":\"sample\"}",
+              "status": "completed"
+            }
+          ],
+          "usage": {
+            "input_tokens": 90,
+            "output_tokens": 34,
+            "total_tokens": 124
+          }
+        }
+      }
+    ]
+  },
+  {
+    "name": "gpt-6-luna/01_full_parameters",
+    "events": [
+      {
+        "type": "response.output_item.added",
+        "output_index": 0,
+        "item": {
+          "type": "message",
+          "id": "test_item_0",
+          "role": "assistant",
+          "status": "in_progress",
+          "content": [],
+          "phase": "final_answer"
+        }
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "测试"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "成功"
+      },
+      {
+        "type": "response.output_item.done",
+        "output_index": 0,
+        "item": {
+          "type": "message",
+          "id": "test_item_0",
+          "role": "assistant",
+          "status": "completed",
+          "content": [
+            {
+              "type": "output_text",
+              "text": "测试成功",
+              "annotations": [],
+              "logprobs": []
+            }
+          ],
+          "phase": "final_answer"
+        }
+      },
+      {
+        "type": "response.completed",
+        "response": {
+          "status": "completed",
+          "output": [
+            {
+              "type": "message",
+              "id": "test_item_0",
+              "role": "assistant",
+              "status": "completed",
+              "content": [
+                {
+                  "type": "output_text",
+                  "text": "测试成功",
+                  "annotations": [],
+                  "logprobs": []
+                }
+              ],
+              "phase": "final_answer"
+            }
+          ],
+          "usage": {
+            "input_tokens": 17,
+            "output_tokens": 6,
+            "total_tokens": 23
+          }
+        }
+      }
+    ]
+  },
+  {
+    "name": "gpt-6-luna/05_search_greeting",
+    "events": [
+      {
+        "type": "response.output_item.added",
+        "output_index": 0,
+        "item": {
+          "id": "test_item_0",
+          "type": "message",
+          "status": "in_progress",
+          "content": [],
+          "phase": "final_answer",
+          "role": "assistant"
+        }
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "你好"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "！"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "有什么"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "我"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "可以"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "帮"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "你"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "？"
+      },
+      {
+        "type": "response.output_item.done",
+        "output_index": 0,
+        "item": {
+          "id": "test_item_0",
+          "type": "message",
+          "status": "completed",
+          "content": [
+            {
+              "type": "output_text",
+              "annotations": [],
+              "logprobs": [],
+              "text": "你好！有什么我可以帮你？"
+            }
+          ],
+          "phase": "final_answer",
+          "role": "assistant"
+        }
+      },
+      {
+        "type": "response.completed",
+        "response": {
+          "status": "completed",
+          "output": [],
+          "usage": {
+            "input_tokens": 4460,
+            "output_tokens": 12,
+            "total_tokens": 4472
+          }
+        }
+      }
+    ]
+  },
+  {
+    "name": "gpt-6-luna/05_search_active",
+    "events": [
+      {
+        "type": "response.output_item.added",
+        "output_index": 0,
+        "item": {
+          "id": "test_item_0",
+          "type": "web_search_call",
+          "status": "in_progress"
+        }
+      },
+      {
+        "type": "response.output_item.done",
+        "output_index": 0,
+        "item": {
+          "id": "test_item_0",
+          "type": "web_search_call",
+          "status": "completed",
+          "action": {
+            "type": "search",
+            "queries": [
+              "site:blog.python.org latest Python blog announcement",
+              "blog.python.org"
+            ],
+            "query": "site:blog.python.org latest Python blog announcement"
+          }
+        }
+      },
+      {
+        "type": "response.output_item.added",
+        "output_index": 1,
+        "item": {
+          "id": "test_item_1",
+          "type": "message",
+          "status": "in_progress",
+          "content": [],
+          "phase": "final_answer",
+          "role": "assistant"
+        }
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_1",
+        "output_index": 1,
+        "content_index": 0,
+        "delta": "Python 官方博客最新公告标题是"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_1",
+        "output_index": 1,
+        "content_index": 0,
+        "delta": " **“Python 3.16.0 alpha"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_1",
+        "output_index": 1,
+        "content_index": 0,
+        "delta": " 2 is now available”**，发布日期为 **"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_1",
+        "output_index": 1,
+        "content_index": 0,
+        "delta": "2026 年 "
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_1",
+        "output_index": 1,
+        "content_index": 0,
+        "delta": "11 月 10"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_1",
+        "output_index": 1,
+        "content_index": 0,
+        "delta": " 日**。"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_1",
+        "output_index": 1,
+        "content_index": 0,
+        "delta": "([blog.python.org](https://blog.python.org/blog/year/2026/?utm_source=openai)"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_1",
+        "output_index": 1,
+        "content_index": 0,
+        "delta": ")"
+      },
+      {
+        "type": "response.output_item.done",
+        "output_index": 1,
+        "item": {
+          "id": "test_item_1",
+          "type": "message",
+          "status": "completed",
+          "content": [
+            {
+              "type": "output_text",
+              "annotations": [
+                {
+                  "type": "url_citation",
+                  "end_index": 169,
+                  "start_index": 91,
+                  "title": "2026 Posts | Python Insider",
+                  "url": "https://blog.python.org/blog/year/2026/?utm_source=openai"
+                }
+              ],
+              "logprobs": [],
+              "text": "Python 官方博客最新公告标题是 **“Python 3.16.0 alpha 2 is now available”**，发布日期为 **2026 年 11 月 10 日**。([blog.python.org](https://blog.python.org/blog/year/2026/?utm_source=openai))"
+            }
+          ],
+          "phase": "final_answer",
+          "role": "assistant"
+        }
+      },
+      {
+        "type": "response.completed",
+        "response": {
+          "status": "completed",
+          "output": [],
+          "usage": {
+            "input_tokens": 8591,
+            "output_tokens": 104,
+            "total_tokens": 8695
+          }
+        }
+      }
+    ]
+  },
+  {
+    "name": "gpt-6-luna/05_mixed_first",
+    "events": [
+      {
+        "type": "response.output_item.added",
+        "output_index": 0,
+        "item": {
+          "id": "test_item_0",
+          "type": "function_call",
+          "status": "in_progress",
+          "arguments": "",
+          "call_id": "test_item_1",
+          "name": "get_test_value"
+        }
+      },
+      {
+        "type": "response.output_item.done",
+        "output_index": 0,
+        "item": {
+          "id": "test_item_0",
+          "type": "function_call",
+          "status": "completed",
+          "arguments": "{\"id\":\"sample\"}",
+          "call_id": "test_item_1",
+          "name": "get_test_value"
+        }
+      },
+      {
+        "type": "response.completed",
+        "response": {
+          "status": "completed",
+          "output": [],
+          "usage": {
+            "input_tokens": 4526,
+            "output_tokens": 19,
+            "total_tokens": 4545
+          }
+        }
+      }
+    ]
+  },
+  {
+    "name": "gpt-6-luna/05_mixed_diagnostic_reconstructed_second",
+    "events": [
+      {
+        "type": "response.output_item.added",
+        "output_index": 0,
+        "item": {
+          "id": "test_item_0",
+          "type": "message",
+          "status": "in_progress",
+          "content": [],
+          "phase": "final_answer",
+          "role": "assistant"
+        }
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "TO"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "OL"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "_F"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "9"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "FE"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "192"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "960"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "983"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "6"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "B"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "9"
+      },
+      {
+        "type": "response.output_item.done",
+        "output_index": 0,
+        "item": {
+          "id": "test_item_0",
+          "type": "message",
+          "status": "completed",
+          "content": [
+            {
+              "type": "output_text",
+              "annotations": [],
+              "logprobs": [],
+              "text": "TOOL_F9FE1929609836B9"
+            }
+          ],
+          "phase": "final_answer",
+          "role": "assistant"
+        }
+      },
+      {
+        "type": "response.completed",
+        "response": {
+          "status": "completed",
+          "output": [],
+          "usage": {
+            "input_tokens": 4573,
+            "output_tokens": 15,
+            "total_tokens": 4588
+          }
+        }
+      }
+    ]
+  },
+  {
+    "name": "gpt-6.1-terra/01_full_parameters",
+    "events": [
+      {
+        "type": "response.output_item.added",
+        "output_index": 0,
+        "item": {
+          "type": "message",
+          "id": "test_item_0",
+          "role": "assistant",
+          "status": "in_progress",
+          "content": [],
+          "phase": "final_answer"
+        }
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "测试"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "成功"
+      },
+      {
+        "type": "response.output_item.done",
+        "output_index": 0,
+        "item": {
+          "type": "message",
+          "id": "test_item_0",
+          "role": "assistant",
+          "status": "completed",
+          "content": [
+            {
+              "type": "output_text",
+              "text": "测试成功",
+              "annotations": [],
+              "logprobs": []
+            }
+          ],
+          "phase": "final_answer"
+        }
+      },
+      {
+        "type": "response.completed",
+        "response": {
+          "status": "completed",
+          "output": [
+            {
+              "type": "message",
+              "id": "test_item_0",
+              "role": "assistant",
+              "status": "completed",
+              "content": [
+                {
+                  "type": "output_text",
+                  "text": "测试成功",
+                  "annotations": [],
+                  "logprobs": []
+                }
+              ],
+              "phase": "final_answer"
+            }
+          ],
+          "usage": {
+            "input_tokens": 17,
+            "output_tokens": 6,
+            "total_tokens": 23
+          }
+        }
+      }
+    ]
+  },
+  {
+    "name": "gpt-6.1-terra/05_search_greeting",
+    "events": [
+      {
+        "type": "response.output_item.added",
+        "output_index": 0,
+        "item": {
+          "id": "test_item_0",
+          "type": "message",
+          "status": "in_progress",
+          "content": [],
+          "phase": "final_answer",
+          "role": "assistant"
+        }
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "你好"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "！"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "有什么"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "我"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "可以"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "帮"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "你"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "的吗"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "？"
+      },
+      {
+        "type": "response.output_item.done",
+        "output_index": 0,
+        "item": {
+          "id": "test_item_0",
+          "type": "message",
+          "status": "completed",
+          "content": [
+            {
+              "type": "output_text",
+              "annotations": [],
+              "logprobs": [],
+              "text": "你好！有什么我可以帮你的吗？"
+            }
+          ],
+          "phase": "final_answer",
+          "role": "assistant"
+        }
+      },
+      {
+        "type": "response.completed",
+        "response": {
+          "status": "completed",
+          "output": [],
+          "usage": {
+            "input_tokens": 4460,
+            "output_tokens": 13,
+            "total_tokens": 4473
+          }
+        }
+      }
+    ]
+  },
+  {
+    "name": "gpt-6.1-terra/05_search_active",
+    "events": [
+      {
+        "type": "response.output_item.added",
+        "output_index": 0,
+        "item": {
+          "id": "test_item_0",
+          "type": "web_search_call",
+          "status": "in_progress"
+        }
+      },
+      {
+        "type": "response.output_item.done",
+        "output_index": 0,
+        "item": {
+          "id": "test_item_0",
+          "type": "web_search_call",
+          "status": "completed",
+          "action": {
+            "type": "open_page",
+            "url": "https://blog.python.org/"
+          }
+        }
+      },
+      {
+        "type": "response.output_item.added",
+        "output_index": 1,
+        "item": {
+          "id": "test_item_1",
+          "type": "message",
+          "status": "in_progress",
+          "content": [],
+          "phase": "final_answer",
+          "role": "assistant"
+        }
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_1",
+        "output_index": 1,
+        "content_index": 0,
+        "delta": "Python 官方博客最新"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_1",
+        "output_index": 1,
+        "content_index": 0,
+        "delta": "发布公告：\n\n"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_1",
+        "output_index": 1,
+        "content_index": 0,
+        "delta": "- **标题："
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_1",
+        "output_index": 1,
+        "content_index": 0,
+        "delta": "** Python "
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_1",
+        "output_index": 1,
+        "content_index": 0,
+        "delta": "3.16."
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_1",
+        "output_index": 1,
+        "content_index": 0,
+        "delta": "0 alpha 2"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_1",
+        "output_index": 1,
+        "content_index": 0,
+        "delta": " is now available"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_1",
+        "output_index": 1,
+        "content_index": 0,
+        "delta": "\n- **发布日期"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_1",
+        "output_index": 1,
+        "content_index": 0,
+        "delta": "：** "
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_1",
+        "output_index": 1,
+        "content_index": 0,
+        "delta": "2026 年 11"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_1",
+        "output_index": 1,
+        "content_index": 0,
+        "delta": " 月 10 日。"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_1",
+        "output_index": 1,
+        "content_index": 0,
+        "delta": "([blog.python.org](https://blog.python.org/))"
+      },
+      {
+        "type": "response.output_item.done",
+        "output_index": 1,
+        "item": {
+          "id": "test_item_1",
+          "type": "message",
+          "status": "completed",
+          "content": [
+            {
+              "type": "output_text",
+              "annotations": [
+                {
+                  "type": "url_citation",
+                  "end_index": 143,
+                  "start_index": 98,
+                  "title": "Python Insider",
+                  "url": "https://blog.python.org/"
+                }
+              ],
+              "logprobs": [],
+              "text": "Python 官方博客最新发布公告：\n\n- **标题：** Python 3.16.0 alpha 2 is now available\n- **发布日期：** 2026 年 11 月 10 日。([blog.python.org](https://blog.python.org/))"
+            }
+          ],
+          "phase": "final_answer",
+          "role": "assistant"
+        }
+      },
+      {
+        "type": "response.completed",
+        "response": {
+          "status": "completed",
+          "output": [],
+          "usage": {
+            "input_tokens": 5561,
+            "output_tokens": 90,
+            "total_tokens": 5651
+          }
+        }
+      }
+    ]
+  },
+  {
+    "name": "gpt-6.1-terra/05_mixed_first",
+    "events": [
+      {
+        "type": "response.output_item.added",
+        "output_index": 0,
+        "item": {
+          "id": "test_item_0",
+          "type": "function_call",
+          "status": "in_progress",
+          "arguments": "",
+          "call_id": "test_item_1",
+          "name": "get_test_value"
+        }
+      },
+      {
+        "type": "response.output_item.done",
+        "output_index": 0,
+        "item": {
+          "id": "test_item_0",
+          "type": "function_call",
+          "status": "completed",
+          "arguments": "{\"id\":\"sample\"}",
+          "call_id": "test_item_1",
+          "name": "get_test_value"
+        }
+      },
+      {
+        "type": "response.completed",
+        "response": {
+          "status": "completed",
+          "output": [],
+          "usage": {
+            "input_tokens": 4526,
+            "output_tokens": 19,
+            "total_tokens": 4545
+          }
+        }
+      }
+    ]
+  },
+  {
+    "name": "gpt-6.1-terra/05_mixed_diagnostic_reconstructed_second",
+    "events": [
+      {
+        "type": "response.output_item.added",
+        "output_index": 0,
+        "item": {
+          "id": "test_item_0",
+          "type": "message",
+          "status": "in_progress",
+          "content": [],
+          "phase": "final_answer",
+          "role": "assistant"
+        }
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "TO"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "OL"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "_"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "780"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "BF"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "546"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "1"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "F"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "27"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "FE"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "6"
+      },
+      {
+        "type": "response.output_text.delta",
+        "item_id": "test_item_0",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "E"
+      },
+      {
+        "type": "response.output_item.done",
+        "output_index": 0,
+        "item": {
+          "id": "test_item_0",
+          "type": "message",
+          "status": "completed",
+          "content": [
+            {
+              "type": "output_text",
+              "annotations": [],
+              "logprobs": [],
+              "text": "TOOL_780BF5461F27FE6E"
+            }
+          ],
+          "phase": "final_answer",
+          "role": "assistant"
+        }
+      },
+      {
+        "type": "response.completed",
+        "response": {
+          "status": "completed",
+          "output": [],
+          "usage": {
+            "input_tokens": 4574,
+            "output_tokens": 16,
+            "total_tokens": 4590
+          }
+        }
+      }
+    ]
+  },
+  {
+    "name": "gpt-6.1-terra/09_reasoning_function_first",
+    "events": [
+      {
+        "type": "response.output_item.added",
+        "output_index": 0,
+        "item": {
+          "type": "reasoning",
+          "id": "test_item_0",
+          "summary": [],
+          "content": [],
+          "encrypted_content": "opaque-encrypted-test-placeholder"
+        }
+      },
+      {
+        "type": "response.output_item.done",
+        "output_index": 0,
+        "item": {
+          "type": "reasoning",
+          "id": "test_item_0",
+          "summary": [],
+          "content": [],
+          "encrypted_content": "opaque-encrypted-test-placeholder"
+        }
+      },
+      {
+        "type": "response.output_item.added",
+        "output_index": 1,
+        "item": {
+          "type": "function_call",
+          "id": "test_item_1",
+          "call_id": "test_item_2",
+          "name": "get_test_value",
+          "arguments": "",
+          "status": "in_progress"
+        }
+      },
+      {
+        "type": "response.output_item.done",
+        "output_index": 1,
+        "item": {
+          "type": "function_call",
+          "id": "test_item_1",
+          "call_id": "test_item_2",
+          "name": "get_test_value",
+          "arguments": "{\"id\":\"sample\"}",
+          "status": "completed"
+        }
+      },
+      {
+        "type": "response.completed",
+        "response": {
+          "status": "completed",
+          "output": [
+            {
+              "type": "reasoning",
+              "id": "test_item_0",
+              "summary": [],
+              "content": [],
+              "encrypted_content": "opaque-encrypted-test-placeholder"
+            },
+            {
+              "type": "function_call",
+              "id": "test_item_1",
+              "call_id": "test_item_2",
+              "name": "get_test_value",
+              "arguments": "{\"id\":\"sample\"}",
+              "status": "completed"
+            }
+          ],
+          "usage": {
+            "input_tokens": 90,
+            "output_tokens": 28,
+            "total_tokens": 118
+          }
+        }
+      }
+    ]
+  }
+]

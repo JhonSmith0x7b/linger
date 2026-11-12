@@ -4,6 +4,8 @@ mod credentials;
 mod devices;
 mod overlay;
 mod prompts;
+#[cfg(test)]
+mod response_compat_tests;
 mod session;
 mod settings;
 mod shortcut_capture;
