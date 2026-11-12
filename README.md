@@ -2,7 +2,7 @@
 
 macOS / Windows 桌面 AI 陪伴应用。Tauri 2 + React + Rust + SQLite，聊天与识别采用 OpenAI API，可配置局域网 NewAPI 中转；语音合成另支持阿里云 CosyVoice 和 MiniMax。
 
-当前版本 **0.1.26**，处于实际试用阶段。**已知问题：Windows 悬浮窗的部分按钮在实际使用中仍可能无法点击，尚未修复。** 详情见[已知问题](docs/known-issues.md)。
+当前版本 **0.1.27**，处于实际试用阶段。**已知问题：Windows 悬浮窗的部分按钮在实际使用中仍可能无法点击，尚未修复。** 详情见[已知问题](docs/known-issues.md)。
 
 [下载 Windows 安装包](https://github.com/JhonSmith0x7b/linger/releases/latest) · [构建与发布说明](docs/windows-build.md)
 
@@ -172,6 +172,6 @@ RUSTUP_HOME="$PWD/.cache/rustup" CARGO_HOME="$PWD/.cache/cargo" cargo test --man
 
 「陪伴与屏幕」可关闭保存（保存设置后清空旧图）或单独清空截图；聊天文字保留。清空对话会同时清空互动档案和截图，保留用户档案与长期记忆。后台没有每张截图额外生成描述的模型调用，复用已有活动简记。工具档案只保存必要摘要，不保存原始完整网页、音频或 reasoning 密文。
 
-### 开发中：时间上下文
+### 0.1.27 时间上下文
 
 固定角色与通用规则保留在 `instructions`；历史消息带固定发送时间与类型。用户档案、记忆、摘要、截图索引及本轮时间放在历史之后、当前输入之前，以减少动态字段对历史前缀缓存的干扰。当前本机时间精确到分钟，包含日期、星期和 UTC 偏移；同一轮工具调用沿用时间基准。上次用户发言独立查询，不把自动观察当成用户回应。所有文字仍计入6000 token预算，裁剪只移除历史消息，保留本轮上下文与工具配对。实际缓存命中由服务端决定。
