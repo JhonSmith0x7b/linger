@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<title>Linger 音乐连接</title>
+<style>
+body{font:14px system-ui;margin:0;padding:18px;width:380px;background:#f5f7f4;color:#21382d}h2{font-size:18px;margin:0 0 8px}p,small{color:#58675f;line-height:1.5}label{display:block;margin:12px 0 4px;font-weight:600}input,select,button{font:inherit;padding:9px;box-sizing:border-box;border:1px solid #b8c6bd;border-radius:7px}input,select{width:100%;background:white}button{cursor:pointer;background:#e6eee8;color:#203c2c}button.primary{background:#2b6043;color:white}button:disabled{opacity:.5;cursor:wait}.row{display:flex;gap:7px;margin:9px 0}.row>*{flex:1;min-width:0}pre{white-space:pre-wrap;overflow-wrap:anywhere;font:11px monospace;max-height:170px;overflow:auto;background:#e9eee9;padding:8px}#connection{padding:9px;border-radius:6px;background:#e6eee8}#feedback{white-space:pre-wrap;color:#6c402d}hr{border:0;border-top:1px solid #ccd5ce;margin:17px 0}
+</style>
+<h2>Linger · YouTube Music</h2>
+<small>只操作你绑定的音乐标签页，不切换窗口。首次使用请先在网页播放一次歌曲。</small>
+<p id="connection" role="status">正在读取连接状态…</p>
+<label for="token">Linger 配对码</label><input id="token" type="password" autocomplete="off" placeholder="从 Linger 音乐连接设置中复制">
+<label for="port">本机端口</label><input id="port" type="number" value="47831" min="1024" max="65535">
+<label for="tab">控制的 YouTube Music 标签页</label><select id="tab"></select>
+<div class="row"><button class="primary" id="save">配对并连接</button><button id="disconnect">断开</button></div>
+<p id="feedback" role="status"></p>
+<hr>
+<label for="query">试一下搜歌</label><input id="query" placeholder="歌名 / 歌手" maxlength="200"><div class="row"><button id="search">搜索</button><button id="status">播放状态</button></div>
+<select id="candidate" aria-label="搜索结果"></select>
+<div class="row"><button id="play">播放选中歌曲</button><button id="queue">加入队列</button></div>
+<div class="row"><button id="pause">暂停</button><button id="resume">继续</button><button id="next">下一首</button></div>
+<details><summary>最近操作日志</summary><pre id="logs"></pre></details>
+<script src="panel.js" type="module"></script>
+</html>

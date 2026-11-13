@@ -11,6 +11,7 @@ use tauri::{Emitter, Manager};
 pub enum Layout {
     #[default]
     Orb,
+    Notice,
     Tools,
     Chat,
     Translate,
@@ -21,6 +22,7 @@ impl Layout {
     fn size(self) -> (f64, f64) {
         match self {
             Self::Orb => (96.0, 56.0),
+            Self::Notice => (192.0, 88.0),
             Self::Tools => (320.0, 320.0),
             Self::Bubble => (320.0, 132.0),
             Self::Chat | Self::Translate | Self::More => (320.0, 440.0),
@@ -71,7 +73,12 @@ fn placement(
     } else {
         (mode.size().1 - 64.0).min((work[3] / scale - 64.0).max(1.0))
     };
-    let panel_width = 320.0_f64.min(work[2] / scale);
+    let panel_width = (if mode == Layout::Notice {
+        192.0_f64
+    } else {
+        320.0_f64
+    })
+    .min(work[2] / scale);
     let panel_left = (anchor.0 - (panel_width - 28.0) * scale)
         .clamp(left, (right - panel_width * scale).max(left));
     let above = anchor.1 - top >= (panel_height + 36.0) * scale;
@@ -194,11 +201,76 @@ fn hit(layout: Layout, width: f64, height: f64, x: f64, y: f64, speaking: bool) 
         return true;
     }
     match layout {
-        Layout::Orb => false,
+        Layout::Orb | Layout::Notice => false,
         Layout::Tools => (0..if speaking { 4 } else { 3 })
             .any(|i| circle(x, y, width - 118.0 - 42.0 * i as f64, height - 28.0, 18.0)),
         _ => rounded_rect(x, y, 4.0, 4.0, width - 4.0, height - 64.0, 16.0),
     }
+}
+
+const POSITION_KEY: &str = "compact_position_v1";
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SavedPosition {
+    monitor: Option<String>,
+    x: f64,
+    y: f64,
+}
+impl SavedPosition {
+    fn anchor(&self, area: [f64; 4], scale: f64) -> Option<(f64, f64)> {
+        if !self.x.is_finite() || !self.y.is_finite() || area[2] <= 0.0 || area[3] <= 0.0 {
+            return None;
+        }
+        let margin_x = (28.0 * scale).min(area[2] / 2.0);
+        let margin_y = (28.0 * scale).min(area[3] / 2.0);
+        Some((
+            (area[0] + self.x * area[2]).clamp(area[0] + margin_x, area[0] + area[2] - margin_x),
+            (area[1] + self.y * area[3]).clamp(area[1] + margin_y, area[1] + area[3] - margin_y),
+        ))
+    }
+}
+fn work_area(monitor: &tauri::Monitor) -> [f64; 4] {
+    let area = monitor.work_area();
+    [
+        area.position.x as f64,
+        area.position.y as f64,
+        area.size.width as f64,
+        area.size.height as f64,
+    ]
+}
+
+// Poll the ball center, not the window origin: expanding cards must not move the saved ball.
+fn remember_position(
+    app: &tauri::AppHandle,
+    window: &tauri::WebviewWindow,
+) -> Result<String, String> {
+    let state = app.state::<Overlay>();
+    let scale = window.scale_factor().map_err(|e| e.to_string())?;
+    let pos = window.inner_position().map_err(|e| e.to_string())?;
+    let Some(p) = *state.placement.lock().unwrap() else {
+        return Err("悬浮球尚未定位".into());
+    };
+    let anchor = (
+        pos.x as f64 + p.orb_x * scale,
+        pos.y as f64 + p.orb_y * scale,
+    );
+    let monitors = app.available_monitors().map_err(|e| e.to_string())?;
+    let monitor = monitors
+        .iter()
+        .find(|monitor| {
+            let a = work_area(monitor);
+            anchor.0 >= a[0]
+                && anchor.0 <= a[0] + a[2]
+                && anchor.1 >= a[1]
+                && anchor.1 <= a[1] + a[3]
+        })
+        .ok_or("悬浮球不在可见屏幕内")?;
+    let area = work_area(monitor);
+    serde_json::to_string(&SavedPosition {
+        monitor: monitor.name().cloned(),
+        x: ((anchor.0 - area[0]) / area[2] * 100000.0).round() / 100000.0,
+        y: ((anchor.1 - area[1]) / area[3] * 100000.0).round() / 100000.0,
+    })
+    .map_err(|e| e.to_string())
 }
 
 pub fn show(app: &tauri::AppHandle) -> Result<(), String> {
@@ -216,6 +288,7 @@ pub fn show(app: &tauri::AppHandle) -> Result<(), String> {
     .transparent(true)
     .shadow(false)
     .focused(false)
+    .visible(false)
     .accept_first_mouse(true)
     .resizable(false)
     .always_on_top(true)
@@ -228,7 +301,42 @@ pub fn show(app: &tauri::AppHandle) -> Result<(), String> {
             (area.position.y as f64 + area.size.height as f64) / scale - 110.0,
         );
     }
-    builder.build().map_err(|e| e.to_string())?;
+    let window = builder.build().map_err(|e| e.to_string())?;
+    let core = app.state::<std::sync::Arc<crate::Core>>();
+    let saved = core
+        .store
+        .get_meta(POSITION_KEY)?
+        .and_then(|value| serde_json::from_str::<SavedPosition>(&value).ok());
+    if let Some(saved) = saved {
+        let monitors = app.available_monitors().map_err(|e| e.to_string())?;
+        let monitor = monitors
+            .iter()
+            .find(|m| saved.monitor.is_some() && m.name() == saved.monitor.as_ref())
+            .cloned()
+            .or(app.primary_monitor().map_err(|e| e.to_string())?)
+            .or_else(|| monitors.first().cloned());
+        if let Some(monitor) = monitor {
+            let scale = monitor.scale_factor();
+            let area = work_area(&monitor);
+            if let Some(anchor) = saved.anchor(area, scale) {
+                let ((x, y), p) = placement(Layout::Orb, anchor, scale, area);
+                window
+                    .set_position(tauri::PhysicalPosition::new(
+                        x.round() as i32,
+                        y.round() as i32,
+                    ))
+                    .map_err(|e| e.to_string())?;
+                window
+                    .set_size(tauri::PhysicalSize::new(
+                        (p.width * scale).round() as u32,
+                        (p.height * scale).round() as u32,
+                    ))
+                    .map_err(|e| e.to_string())?;
+                *app.state::<Overlay>().placement.lock().unwrap() = Some(p);
+            }
+        }
+    }
+    window.show().map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -325,6 +433,9 @@ pub fn start_hit_testing(app: tauri::AppHandle) {
     tauri::async_runtime::spawn(async move {
         let mut audio_tick = 0u8;
         let mut previous_hover = None;
+        let mut position_tick = 0u8;
+        let mut candidate_position = None;
+        let mut saved_position = None;
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(40));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -333,6 +444,20 @@ pub fn start_hit_testing(app: tauri::AppHandle) {
                 continue;
             };
             let state = app.state::<Overlay>();
+            position_tick = (position_tick + 1) % 10;
+            if position_tick == 0 {
+                if let Ok(position) = remember_position(&app, &window) {
+                    if candidate_position.as_ref() == Some(&position)
+                        && saved_position.as_ref() != Some(&position)
+                    {
+                        let core = app.state::<std::sync::Arc<crate::Core>>();
+                        if core.store.set_meta(POSITION_KEY, &position).is_ok() {
+                            saved_position = Some(position.clone());
+                        }
+                    }
+                    candidate_position = Some(position);
+                }
+            }
             if !window.is_visible().unwrap_or(false) {
                 state.interacting.store(false, Ordering::SeqCst);
                 previous_hover = None;
@@ -415,9 +540,47 @@ pub fn start_hit_testing(app: tauri::AppHandle) {
 mod tests {
     use super::*;
     #[test]
+    fn saved_ball_position_handles_display_changes_and_invalid_values() {
+        let p = SavedPosition {
+            monitor: Some("external".into()),
+            x: 0.75,
+            y: 0.5,
+        };
+        assert_eq!(
+            p.anchor([-1920.0, 0.0, 1920.0, 1080.0], 1.0),
+            Some((-480.0, 540.0))
+        );
+        assert_eq!(
+            p.anchor([0.0, 0.0, 2560.0, 1440.0], 2.0),
+            Some((1920.0, 720.0))
+        );
+        let out = SavedPosition {
+            x: -2.0,
+            y: 4.0,
+            ..p.clone()
+        };
+        assert_eq!(
+            out.anchor([0.0, 0.0, 1920.0, 1080.0], 2.0),
+            Some((56.0, 1024.0))
+        );
+        assert!(SavedPosition {
+            x: f64::NAN,
+            ..p.clone()
+        }
+        .anchor([0.0, 0.0, 1920.0, 1080.0], 1.0)
+        .is_none());
+        let restored: SavedPosition =
+            serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
+        assert_eq!(
+            restored.anchor([0.0, 0.0, 1920.0, 1080.0], 1.0),
+            p.anchor([0.0, 0.0, 1920.0, 1080.0], 1.0)
+        );
+    }
+    #[test]
     fn transparent_pixels_pass_through_but_orb_controls_and_cards_work() {
         assert!(hit(Layout::Orb, 56.0, 56.0, 28.0, 28.0, false));
         assert!(!hit(Layout::Orb, 56.0, 56.0, 1.0, 1.0, false));
+        assert!(!hit(Layout::Notice, 192.0, 88.0, 80.0, 12.0, false));
         assert!(hit(Layout::Tools, 280.0, 72.0, 120.0, 44.0, false));
         assert!(!hit(Layout::Tools, 280.0, 72.0, 225.0, 44.0, false));
         assert!(!hit(Layout::Tools, 280.0, 72.0, 141.0, 44.0, false));
@@ -487,6 +650,7 @@ mod tests {
             ] {
                 for mode in [
                     Layout::Orb,
+                    Layout::Notice,
                     Layout::Tools,
                     Layout::Chat,
                     Layout::Translate,

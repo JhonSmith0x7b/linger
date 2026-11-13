@@ -2652,11 +2652,12 @@ dependencies = [
 
 [[package]]
 name = "linger"
-version = "0.1.27"
+version = "0.1.28"
 dependencies = [
  "base64 0.22.1",
  "chrono",
  "cpal",
+ "getrandom 0.2.17",
  "hound",
  "image",
  "keyring",

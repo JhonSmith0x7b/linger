@@ -36,6 +36,7 @@ jobs:
           node -e 'const fs=require("fs"); const p=require("./package.json"); const t=require("./src-tauri/tauri.conf.json"); const c=fs.readFileSync("src-tauri/Cargo.toml","utf8").match(/^version = "([^"]+)"/m)[1]; if (process.env.RELEASE_TAG !== "v"+p.version || p.version !== t.version || p.version !== c) throw Error("Release tag and app versions must match");'
       - run: npm ci
       - run: npm run build
+      - run: node --test browser-extension/youtube-music/page.test.mjs
       - run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
       - run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked -- -D warnings
       - run: cargo test --manifest-path src-tauri/Cargo.toml --locked

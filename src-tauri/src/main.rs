@@ -2,10 +2,13 @@
 mod api;
 mod credentials;
 mod devices;
+mod diagnostics;
 mod history;
 mod history_budget;
+mod music;
 mod overlay;
 mod prompts;
+mod request_retry;
 #[cfg(test)]
 mod response_compat_tests;
 mod session;
@@ -31,6 +34,7 @@ use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 use tauri_plugin_opener::OpenerExt;
 
 pub struct Core {
+    music: Mutex<Option<Arc<music::MusicBridge>>>,
     settings: Mutex<Settings>,
     credentials: credentials::Credentials,
     last_status: Mutex<serde_json::Value>,
@@ -43,7 +47,6 @@ pub struct Core {
     recording_epoch: AtomicU64,
     observation_request: AtomicU64,
     observation_activity: Mutex<std::time::Instant>,
-    memory_retry_after: AtomicU64,
     busy: AtomicBool,
     recording: AtomicBool,
     cancelled: tokio::sync::watch::Sender<u64>,
@@ -55,6 +58,13 @@ pub struct Core {
     shortcut_capture: Mutex<shortcut_capture::ShortcutCapture>,
 }
 impl Core {
+    fn music_bridge(&self) -> Result<Arc<music::MusicBridge>, String> {
+        self.music
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| "请先在设置 → 音乐连接中启用并配对浏览器扩展".into())
+    }
     fn settings(&self) -> Settings {
         self.settings.lock().unwrap().clone()
     }
@@ -126,6 +136,12 @@ fn key_entry(base: &str) -> Result<keyring::Entry, String> {
     keyring::Entry::new("com.linger.desktop", base).map_err(|e| format!("系统凭据存储不可用：{e}"))
 }
 fn status(app: &tauri::AppHandle, phase: &str, detail: &str) {
+    diagnostics::record(
+        if phase == "error" { "error" } else { "info" },
+        "app",
+        "status",
+        json!({"phase":phase,"detail":detail}),
+    );
     let value = json!({"phase":phase,"detail":detail});
     *app.state::<Arc<Core>>().last_status.lock().unwrap() = value.clone();
     let _ = app.emit("linger:status", value);
@@ -203,6 +219,97 @@ fn get_status(core: State<Arc<Core>>) -> serde_json::Value {
 #[tauri::command]
 fn get_settings(core: State<Arc<Core>>) -> Settings {
     core.settings()
+}
+
+#[tauri::command]
+fn get_music_bridge_info(core: State<Arc<Core>>) -> serde_json::Value {
+    match core.music_bridge() {
+        Ok(bridge) => bridge.info(),
+        Err(_) => json!({"enabled":false,"connected":false,"port":47831}),
+    }
+}
+
+#[tauri::command]
+fn open_music_extension_folder(app: tauri::AppHandle) -> Result<(), String> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("browser-extension/youtube-music");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    // Embed the reviewed extension so installed desktop releases need no source checkout.
+    for (name, content) in [
+        (
+            "manifest.json",
+            include_str!("../../browser-extension/youtube-music/manifest.json"),
+        ),
+        (
+            "worker.js",
+            include_str!("../../browser-extension/youtube-music/worker.js"),
+        ),
+        (
+            "page.js",
+            include_str!("../../browser-extension/youtube-music/page.js"),
+        ),
+        (
+            "panel.html",
+            include_str!("../../browser-extension/youtube-music/panel.html"),
+        ),
+        (
+            "panel.js",
+            include_str!("../../browser-extension/youtube-music/panel.js"),
+        ),
+        (
+            "README.md",
+            include_str!("../../browser-extension/youtube-music/README.md"),
+        ),
+    ] {
+        std::fs::write(dir.join(name), content).map_err(|e| e.to_string())?;
+    }
+    app.opener()
+        .open_path(dir.to_string_lossy().to_string(), None::<String>)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn set_music_bridge_enabled(
+    app: tauri::AppHandle,
+    core: State<Arc<Core>>,
+    enabled: bool,
+) -> Result<serde_json::Value, String> {
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let marker = dir.join("music-bridge-enabled");
+    let mut slot = core.music.lock().unwrap();
+    if enabled {
+        if slot.is_none() {
+            let bridge = music::MusicBridge::start(&dir)?;
+            if let Err(e) = std::fs::write(&marker, b"1") {
+                bridge.stop();
+                return Err(e.to_string());
+            }
+            *slot = Some(bridge);
+        }
+    } else {
+        if marker.exists() {
+            std::fs::remove_file(marker).map_err(|e| e.to_string())?;
+        }
+        if let Some(bridge) = slot.take() {
+            bridge.stop();
+        }
+    }
+    Ok(slot
+        .as_ref()
+        .map(|b| b.info())
+        .unwrap_or_else(|| json!({"enabled":false,"connected":false,"port":47831})))
+}
+
+#[tauri::command]
+async fn music_command(
+    core: State<'_, Arc<Core>>,
+    action: String,
+    args: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    core.music_bridge()?.execute(&action, args).await
 }
 #[tauri::command]
 fn key_status(core: State<Arc<Core>>) -> bool {
@@ -649,7 +756,6 @@ fn clear_conversation(app: tauri::AppHandle, core: State<Arc<Core>>) -> Result<(
     core.observation_request.fetch_add(1, Ordering::SeqCst);
     core.activity.lock().unwrap().clear();
     *core.last_frame.lock().unwrap() = None;
-    core.memory_retry_after.store(0, Ordering::SeqCst);
     let observation =
         json!({"phase":"idle","detail":"对话已重置，等待下一次观察","at":null,"captured_at":null});
     *core.observation_status.lock().unwrap() = observation.clone();
@@ -804,6 +910,7 @@ async fn set_observing(
         status(&app, "idle", "主动陪伴已暂停");
         return Ok(());
     }
+    core.store.set_meta("compaction_blocked", "")?;
     core.key().inspect_err(|e| status(&app, "error", e))?;
     let selected = core.settings().capture_source;
     let source = if selected.is_empty() {
@@ -1109,6 +1216,7 @@ fn main() {
         .setup(|app| {
             let dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&dir)?;
+            if diagnostics::init(&dir).is_err() { eprintln!("无法初始化本地诊断日志"); }
             let store = Store::open(&dir.join("linger.sqlite3")).map_err(std::io::Error::other)?;
             let history = history::History::open(&dir).map_err(std::io::Error::other)?;
             let mut after = 0;
@@ -1151,7 +1259,17 @@ fn main() {
             settings.capture_source = devices::startup_source(&settings.capture_source);
             let shortcut = settings.shortcut.clone();
             let (cancelled, _) = tokio::sync::watch::channel(0);
+            let music = if dir.join("music-bridge-enabled").exists() {
+                match music::MusicBridge::start(&dir) {
+                    Ok(bridge) => Some(bridge),
+                    Err(error) => {
+                        diagnostics::record("error", "music", "bridge_start_failed", json!({"error":error}));
+                        None
+                    }
+                }
+            } else { None };
             let core = Arc::new(Core {
+                music: Mutex::new(music),
                 settings: Mutex::new(settings),
                 credentials: credentials::Credentials::default(),
                 observation_status: Mutex::new(json!({"phase":"idle","detail":"本次启动尚未进行自动观察","at":null,"captured_at":null})),
@@ -1164,7 +1282,6 @@ fn main() {
                 recording_epoch: AtomicU64::new(0),
                 observation_request: AtomicU64::new(0),
                 observation_activity: Mutex::new(std::time::Instant::now()),
-                memory_retry_after: AtomicU64::new(0),
                 busy: AtomicBool::new(false),
                 recording: AtomicBool::new(false),
                 cancelled,
@@ -1298,6 +1415,10 @@ fn main() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            get_music_bridge_info,
+            open_music_extension_folder,
+            set_music_bridge_enabled,
+            music_command,
             get_settings,
             get_status,
             get_observation_status,
@@ -1319,6 +1440,10 @@ fn main() {
             rename_reference_voice,
             delete_reference_voice,
             list_messages,
+            diagnostics::get_diagnostic_logs,
+            diagnostics::clear_diagnostic_logs,
+            diagnostics::copy_diagnostic_logs,
+            diagnostics::open_diagnostic_log_folder,
             get_user_profile,
             save_user_profile,
             clear_conversation,

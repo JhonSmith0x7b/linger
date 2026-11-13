@@ -17,6 +17,8 @@ import type {
 import { characters, characterFor, defaultVoiceProfile } from "./characters";
 import { MarkdownText } from "./MarkdownText";
 import { FloatingPanel } from "./FloatingPanel";
+import { LogsPanel } from "./LogsPanel";
+import { MusicSettings } from "./MusicSettings";
 import { UserProfileEditor } from "./UserProfileEditor";
 import { ScreenSourcePicker, sourceLabel } from "./ScreenSourcePicker";
 import { ShortcutRecorder } from "./ShortcutRecorder";
@@ -160,7 +162,7 @@ function timestamp(value: string) {
 }
 
 export default function App() {
-  const [page, setPage] = useState<"chat" | "memory" | "settings">("chat");
+  const [page, setPage] = useState<"chat" | "memory" | "settings" | "logs">("chat");
   const [settings, setSettings] = useState<Settings>(defaults);
   const [draft, setDraft] = useState<Settings>(defaults);
   const [settingsTab, setSettingsTab] = useState("connection");
@@ -423,9 +425,9 @@ export default function App() {
         const stopClear = await listen("linger:conversation-cleared", resetConversationView);
         if (disposed) { stopClear(); return; }
         cleanups.push(stopClear);
-        const stopDelta = await listen<{ text: string }>(
+        const stopDelta = await listen<{ text: string; reset?: boolean }>(
           "linger:delta",
-          ({ payload }) => setStreamText((old) => old + payload.text),
+          ({ payload }) => setStreamText((old) => payload.reset ? "" : old + payload.text),
         );
         if (disposed) {
           stopDelta();
@@ -825,6 +827,7 @@ export default function App() {
               { key: "chat", label: "陪伴", icon: "chat" },
               { key: "memory", label: "记忆", icon: "memory" },
               { key: "settings", label: "设置", icon: "settings" },
+              { key: "logs", label: "查看日志", icon: "memory" },
             ] as const
           ).map((item) => (
             <button
@@ -875,7 +878,7 @@ export default function App() {
         <header className="topbar">
           <div className="breadcrumb">
             你的日常空间 <span>/</span>{" "}
-            {page === "chat" ? "陪伴" : page === "memory" ? "记忆" : "设置"}
+            {page === "chat" ? "陪伴" : page === "memory" ? "记忆" : page === "logs" ? "查看日志" : "设置"}
           </div>
           <div className="privacy-label">
             <span className="tiny-dot" /> 记录保存在本机
@@ -895,6 +898,7 @@ export default function App() {
             使用录音、截图和模型服务。
           </div>
         )}
+        {page === "logs" && <LogsPanel desktop={desktop} />}
         {page === "chat" && (
           <section className="chat-page">
             <div className="page-heading">
@@ -1281,6 +1285,7 @@ export default function App() {
                 { id: "character", label: "角色卡" },
                 { id: "tts", label: "语音连接" },
                 { id: "audio", label: "音频设备" },
+                { id: "music", label: "音乐连接" },
                 { id: "companion", label: "陪伴与屏幕" },
               ].map((tab) => (
                 <button
@@ -1296,6 +1301,7 @@ export default function App() {
               ))}
             </div>
             <form onSubmit={saveSettings} className="settings-form">
+              {settingsTab === "music" && <MusicSettings desktop={desktop} />}
               {settingsTab === "connection" && (
                 <>
                   <div className="section-intro">
@@ -1725,7 +1731,7 @@ export default function App() {
                   </Field>
                 </>
               )}
-              <div className="settings-footer">
+              {settingsTab !== "music" && <div className="settings-footer">
                 <span role="status">{notice || "设置保存在本机"}</span>
                 <button
                   className="primary-button"
@@ -1733,7 +1739,7 @@ export default function App() {
                 >
                   {saving ? "正在保存…" : "保存设置"}
                 </button>
-              </div>
+              </div>}
             </form>
           </section>
         )}

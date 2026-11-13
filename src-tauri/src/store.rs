@@ -17,6 +17,16 @@ pub struct Message {
     pub content: String,
     pub created_at: String,
 }
+/// A summary and its exact coverage boundary are read with the remaining raw messages.
+#[derive(Debug, Clone)]
+pub struct ContextSnapshot {
+    pub revision: i64,
+    pub summary: String,
+    pub through: i64,
+    pub floor: i64,
+    pub messages: Vec<Message>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Memory {
     pub id: i64,
@@ -83,6 +93,11 @@ impl Store {
                 target_model TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL,
                 deleted INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(endpoint,voice_id));
             CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS summary_versions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL,
+                previous_through INTEGER NOT NULL, through INTEGER NOT NULL,
+                previous_summary TEXT NOT NULL, summary TEXT NOT NULL,
+                before_tokens INTEGER NOT NULL, after_tokens INTEGER NOT NULL);
             INSERT OR IGNORE INTO metadata (key,value) VALUES ('memory_revision','0');
         ",
             )
@@ -131,6 +146,7 @@ impl Store {
             .optional()
             .map_err(db_error)
     }
+    #[cfg(test)]
     pub fn messages(&self) -> Result<Vec<Message>> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare("SELECT id,role,content,created_at FROM (SELECT * FROM messages ORDER BY id DESC LIMIT 200) ORDER BY id").map_err(db_error)?;
@@ -309,7 +325,13 @@ impl Store {
         )
         .map_err(db_error)?;
         let id = tx.last_insert_rowid();
-        invalidate_memory_context(&tx)?;
+        // Adding a fact must not erase the recent dialogue or its already committed summary.
+        // Still invalidate any in-flight extraction that did not see the new memory.
+        tx.execute(
+            "UPDATE metadata SET value=CAST(value AS INTEGER)+1 WHERE key='memory_revision'",
+            [],
+        )
+        .map_err(db_error)?;
         tx.commit().map_err(db_error)?;
         Ok(Memory {
             id,
@@ -325,6 +347,14 @@ impl Store {
         let mut conn = self.lock()?;
         let tx = conn.transaction().map_err(db_error)?;
         let timestamp = Utc::now().to_rfc3339();
+        let previous: Option<String> = tx
+            .query_row(
+                "SELECT content FROM memories WHERE id=?1 AND deleted=0",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(db_error)?;
         let changed = tx.execute("UPDATE memories SET content=?1,updated_at=?2,source='explicit' WHERE id=?3 AND deleted=0",params![content,timestamp,id]).map_err(db_error)?;
         if changed == 0 {
             return Err("该记忆不存在或已删除".into());
@@ -336,7 +366,10 @@ impl Store {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .map_err(db_error)?;
-        invalidate_memory_context(&tx)?;
+        invalidate_memory_context(
+            &tx,
+            serde_json::json!({"kind":"updated","id":id,"previous":previous,"current":content}),
+        )?;
         tx.commit().map_err(db_error)?;
         Ok(Memory {
             id,
@@ -349,6 +382,14 @@ impl Store {
     pub fn delete_memory(&self, id: i64) -> Result<()> {
         let mut conn = self.lock()?;
         let tx = conn.transaction().map_err(db_error)?;
+        let previous: Option<String> = tx
+            .query_row(
+                "SELECT content FROM memories WHERE id=?1 AND deleted=0",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(db_error)?;
         let changed = tx
             .execute(
                 "UPDATE memories SET deleted=1,updated_at=?1 WHERE id=?2 AND deleted=0",
@@ -358,7 +399,10 @@ impl Store {
         if changed == 0 {
             return Err("该记忆不存在或已删除".into());
         }
-        invalidate_memory_context(&tx)?;
+        invalidate_memory_context(
+            &tx,
+            serde_json::json!({"kind":"removed","id":id,"previous":previous}),
+        )?;
         tx.commit().map_err(db_error)
     }
     pub fn load_settings(&self) -> Result<Option<Value>> {
@@ -517,6 +561,15 @@ impl Store {
             )
             .map_err(db_error)
     }
+    /// Corrections are authoritative over older summary wording until folded into
+    /// the next successfully committed state. Never infer a removed fact anew.
+    pub fn memory_context_changes(&self) -> Result<String> {
+        let raw = self
+            .get_meta("memory_context_changes")?
+            .unwrap_or_else(|| "[]".into());
+        let changes: Vec<Value> = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+        bounded_context_changes(&changes)
+    }
     pub fn user_profile(&self) -> Result<UserProfile> {
         let conn = self.lock()?;
         read_user_profile(&conn)
@@ -543,15 +596,15 @@ impl Store {
         };
         tx.execute("INSERT INTO metadata(key,value) VALUES ('user_profile',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [&profile.content]).map_err(db_error)?;
         tx.execute("INSERT INTO metadata(key,value) VALUES ('user_profile_revision',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [profile.revision.to_string()]).map_err(db_error)?;
-        // Do not hide chat history when editing the profile. Invalidate only old
-        // derived summaries/extractions; the current profile supersedes past preferences.
+        append_context_change(&tx, serde_json::json!({"kind":"profile_updated"}))?;
+        // The current profile supersedes past preferences. Reject in-flight work,
+        // but retain the committed summary and coverage: resetting them replays
+        // the entire archive into the foreground context.
         tx.execute(
             "UPDATE metadata SET value=CAST(value AS INTEGER)+1 WHERE key='memory_revision'",
             [],
         )
         .map_err(db_error)?;
-        tx.execute("DELETE FROM metadata WHERE key='summary'", [])
-            .map_err(db_error)?;
         tx.commit().map_err(db_error)?;
         Ok(profile)
     }
@@ -559,7 +612,9 @@ impl Store {
         let mut conn = self.lock()?;
         let tx = conn.transaction().map_err(db_error)?;
         tx.execute("DELETE FROM messages", []).map_err(db_error)?;
-        tx.execute("DELETE FROM metadata WHERE key IN ('summary','processed_through','organized_at','last_organized_at','memory_history_floor','introduction_state')", []).map_err(db_error)?;
+        tx.execute("DELETE FROM summary_versions", [])
+            .map_err(db_error)?;
+        tx.execute("DELETE FROM metadata WHERE key IN ('summary','summary_through','processed_through','organized_at','last_organized_at','memory_history_floor','introduction_state','memory_context_changes')", []).map_err(db_error)?;
         tx.execute(
             "UPDATE metadata SET value=CAST(value AS INTEGER)+1 WHERE key='memory_revision'",
             [],
@@ -568,6 +623,129 @@ impl Store {
         // Preserve sqlite_sequence: a later message must not reuse an old ID.
         tx.commit().map_err(db_error)
     }
+    /// One lock prevents pairing a new summary with an old raw-message boundary.
+    pub fn context_snapshot(&self) -> Result<ContextSnapshot> {
+        self.expire_memories()?;
+        let conn = self.lock()?;
+        let revision = read_meta_i64(&conn, "memory_revision")?;
+        let floor = read_meta_i64(&conn, "memory_history_floor")?;
+        let (summary, through) = read_context_summary(&conn)?;
+        let mut stmt = conn
+            .prepare("SELECT id,role,content,created_at FROM messages WHERE id>?1 ORDER BY id")
+            .map_err(db_error)?;
+        let messages = stmt
+            .query_map([floor.max(through)], message_row)
+            .map_err(db_error)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(db_error)?;
+        Ok(ContextSnapshot {
+            revision,
+            summary,
+            through,
+            floor,
+            messages,
+        })
+    }
+
+    /// Commit only the captured prefix. Messages appended during generation remain raw.
+    pub fn apply_context_compaction(
+        &self,
+        expected_revision: i64,
+        expected_through: i64,
+        through: i64,
+        summary: &str,
+        contents: &[String],
+    ) -> Result<bool> {
+        if summary.trim().is_empty() {
+            return Err("压缩摘要为空，保留原始对话".into());
+        }
+        for content in contents {
+            valid_memory(content)?;
+        }
+        self.expire_memories()?;
+        let mut conn = self.lock()?;
+        let tx = conn.transaction().map_err(db_error)?;
+        let revision = read_meta_i64(&tx, "memory_revision")?;
+        let (previous_summary, current_through) = read_context_summary(&tx)?;
+        if revision != expected_revision || current_through != expected_through {
+            return Ok(false);
+        }
+        let floor = read_meta_i64(&tx, "memory_history_floor")?;
+        let boundary_exists: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM messages WHERE id=?1)",
+                [through],
+                |r| r.get(0),
+            )
+            .map_err(db_error)?;
+        if through <= current_through.max(floor) || !boundary_exists {
+            return Err("压缩消息边界无效，保留原始对话".into());
+        }
+        let timestamp = Utc::now().to_rfc3339();
+        // Audit the exact accepted text and its replaced source, atomically with
+        // the coverage boundary. These counts describe summary+source text,
+        // not the complete API request (role/profile/tools are excluded).
+        let source_messages = {
+            let mut statement = tx.prepare("SELECT id,role,content,created_at FROM messages WHERE id>?1 AND id<=?2 ORDER BY id").map_err(db_error)?;
+            let rows = statement
+                .query_map(params![current_through.max(floor), through], message_row)
+                .map_err(db_error)?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(db_error)?
+        };
+        let tokenizer = tiktoken_rs::o200k_base_singleton();
+        let before_tokens = tokenizer.encode_ordinary(&previous_summary).len()
+            + tokenizer
+                .encode_ordinary(
+                    &serde_json::to_string(&source_messages).map_err(|e| e.to_string())?,
+                )
+                .len();
+        let after_tokens = tokenizer.encode_ordinary(summary).len();
+        tx.execute("INSERT INTO summary_versions(created_at,previous_through,through,previous_summary,summary,before_tokens,after_tokens) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            params![timestamp, current_through, through, previous_summary, summary, before_tokens, after_tokens]).map_err(db_error)?;
+        tx.execute("DELETE FROM summary_versions WHERE id NOT IN (SELECT id FROM summary_versions ORDER BY id DESC LIMIT 30)", []).map_err(db_error)?;
+        let pending_changes: Option<String> = tx
+            .query_row(
+                "SELECT value FROM metadata WHERE key='memory_context_changes'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(db_error)?;
+        if let Some(pending_changes) = pending_changes {
+            let mut changes: Vec<Value> =
+                serde_json::from_str(&pending_changes).map_err(|e| e.to_string())?;
+            // Partial prefix compaction must not retire corrections while older
+            // contradictory source messages still remain in the raw tail.
+            changes.retain(|change| {
+                change["through"]
+                    .as_i64()
+                    .is_none_or(|boundary| boundary > through)
+            });
+            tx.execute(
+                "UPDATE metadata SET value=?1 WHERE key='memory_context_changes'",
+                [serde_json::to_string(&changes).map_err(|e| e.to_string())?],
+            )
+            .map_err(db_error)?;
+        }
+        for content in contents {
+            tx.execute("INSERT INTO memories(content,updated_at,source,source_through) SELECT ?1,?2,'batch',?3 WHERE NOT EXISTS(SELECT 1 FROM memories WHERE content=?1)",params![content.trim(),timestamp,through]).map_err(db_error)?;
+        }
+        for (key, value) in [
+            ("summary", summary.to_owned()),
+            ("summary_through", through.to_string()),
+            ("processed_through", through.to_string()),
+            ("last_organized_at", timestamp),
+            ("organized_at", Utc::now().timestamp().to_string()),
+            ("memory_revision", (revision + 1).to_string()),
+        ] {
+            tx.execute("INSERT INTO metadata(key,value) VALUES (?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",params![key,value]).map_err(db_error)?;
+        }
+        tx.commit().map_err(db_error)?;
+        Ok(true)
+    }
+
+    #[cfg(test)]
     pub fn memory_revision(&self) -> Result<i64> {
         Ok(self
             .get_meta("memory_revision")?
@@ -576,6 +754,7 @@ impl Store {
     }
     /// Optimistic transaction: stale extraction never overwrites an explicit edit or deletion.
     /// Only the processed range advances; newer messages remain pending.
+    #[cfg(test)]
     pub fn apply_memory_batch(
         &self,
         expected_revision: i64,
@@ -616,6 +795,31 @@ impl Store {
         Ok(true)
     }
 }
+fn read_meta_i64(conn: &Connection, key: &str) -> Result<i64> {
+    Ok(conn
+        .query_row("SELECT value FROM metadata WHERE key=?1", [key], |r| {
+            r.get::<_, String>(0)
+        })
+        .optional()
+        .map_err(db_error)?
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0))
+}
+fn read_context_summary(conn: &Connection) -> Result<(String, i64)> {
+    let through = read_meta_i64(conn, "summary_through")?;
+    let summary: Option<String> = conn
+        .query_row("SELECT value FROM metadata WHERE key='summary'", [], |r| {
+            r.get(0)
+        })
+        .optional()
+        .map_err(db_error)?;
+    // Old processed_through was extraction progress, not proof of context coverage.
+    match summary {
+        Some(summary) if !summary.trim().is_empty() => Ok((summary, through.max(0))),
+        _ => Ok((String::new(), 0)),
+    }
+}
+
 fn read_introduction(conn: &Connection) -> Result<IntroductionState> {
     let stored: Option<String> = conn
         .query_row(
@@ -688,12 +892,25 @@ fn scope_expiration(scope: &str) -> Result<Option<String>> {
 }
 fn expire_in_connection(conn: &mut Connection, startup: bool) -> Result<usize> {
     let tx = conn.transaction().map_err(db_error)?;
+    let expiring = {
+        let mut stmt = tx.prepare("SELECT id,content FROM memories WHERE deleted=0 AND ((?1 AND scope='session') OR (expires_at IS NOT NULL AND julianday(expires_at)<=julianday(?2)))").map_err(db_error)?;
+        let rows = stmt
+            .query_map(params![startup, Utc::now().to_rfc3339()], |r| {
+                Ok(serde_json::json!({"id":r.get::<_,i64>(0)?,"previous":r.get::<_,String>(1)?}))
+            })
+            .map_err(db_error)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(db_error)?
+    };
     let changed = tx.execute(
         "UPDATE memories SET deleted=1 WHERE deleted=0 AND ((?1 AND scope='session') OR (expires_at IS NOT NULL AND julianday(expires_at)<=julianday(?2)))",
         params![startup, Utc::now().to_rfc3339()],
     ).map_err(db_error)?;
     if changed > 0 {
-        invalidate_memory_context(&tx)?;
+        invalidate_memory_context(
+            &tx,
+            serde_json::json!({"kind":"expired","memories":expiring}),
+        )?;
     }
     tx.commit().map_err(db_error)?;
     Ok(changed)
@@ -713,17 +930,96 @@ fn valid_memory(content: &str) -> Result<&str> {
     }
     Ok(content)
 }
-fn invalidate_memory_context(tx: &Transaction<'_>) -> Result<()> {
+// This is prompt-facing metadata, not an archive dump. Full persisted corrections
+// are used for coverage tracking; previews are explicitly labelled when partial.
+fn bounded_context_changes(changes: &[Value]) -> Result<String> {
+    if changes.is_empty() {
+        return Ok("[]".into());
+    }
+    fn preview(value: &Value) -> Value {
+        let text = value.as_str().unwrap_or_default();
+        let excerpt: String = text.chars().take(80).collect();
+        serde_json::json!({"text":excerpt,"truncated":text.chars().count()>80})
+    }
+    fn compact(change: &Value) -> Value {
+        let mut value = serde_json::json!({"kind":change["kind"],"at":change["at"],"through":change["through"]});
+        match change["kind"].as_str() {
+            Some("profile_updated") => {
+                value["rule"] = serde_json::json!("当前完整用户档案替代旧档案偏好，包括已移除的内容；不得从旧摘要恢复。正文见当前档案。");
+            }
+            Some("expired") => {
+                let memories = change["memories"]
+                    .as_array()
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                value["memories"] = serde_json::json!(memories.iter().rev().take(4).map(|m| serde_json::json!({"id":m["id"],"previous_preview":preview(&m["previous"])})).collect::<Vec<_>>());
+                value["omitted_memories"] = serde_json::json!(memories.len().saturating_sub(4));
+            }
+            _ => {
+                value["id"] = change["id"].clone();
+                value["previous_preview"] = preview(&change["previous"]);
+                if change.get("current").is_some() {
+                    value["current_preview"] = preview(&change["current"]);
+                }
+            }
+        }
+        value
+    }
+    let mut payload = serde_json::json!({
+        "rule":"近期权威修正优先于旧摘要。预览不是完整事实；truncated 或 omitted 表示省略。已删除/过期内容不再有效；有效记忆与当前档案优先，不能从旧摘要恢复被撤销的规则。必要时读取当前档案或搜索有效记忆。",
+        "changes":[], "omitted_changes":changes.len()
+    });
+    let tokenizer = tiktoken_rs::o200k_base_singleton();
+    let mut selected = Vec::new();
+    for change in changes.iter().rev() {
+        selected.push(compact(change));
+        payload["changes"] = serde_json::json!(selected);
+        payload["omitted_changes"] = serde_json::json!(changes.len() - selected.len());
+        let candidate = serde_json::to_string(&payload).map_err(|e| e.to_string())?;
+        if tokenizer.encode_ordinary(&candidate).len() > 800 {
+            selected.pop();
+            break;
+        }
+    }
+    payload["changes"] = serde_json::json!(selected);
+    payload["omitted_changes"] = serde_json::json!(changes.len() - selected.len());
+    serde_json::to_string(&payload).map_err(|e| e.to_string())
+}
+
+fn append_context_change(tx: &Transaction<'_>, mut change: Value) -> Result<()> {
+    let stored: Option<String> = tx
+        .query_row(
+            "SELECT value FROM metadata WHERE key='memory_context_changes'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(db_error)?;
+    let mut changes: Vec<Value> = stored
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
+    change["at"] = serde_json::json!(Utc::now().to_rfc3339());
+    change["through"] = serde_json::json!(tx
+        .query_row("SELECT COALESCE(MAX(id),0) FROM messages", [], |r| r
+            .get::<_, i64>(0))
+        .map_err(db_error)?);
+    changes.push(change);
+    if changes.len() > 20 {
+        changes.drain(..changes.len() - 20);
+    }
+    tx.execute("INSERT INTO metadata(key,value) VALUES ('memory_context_changes',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [serde_json::to_string(&changes).map_err(|e| e.to_string())?]).map_err(db_error)?;
+    Ok(())
+}
+fn invalidate_memory_context(tx: &Transaction<'_>, change: Value) -> Result<()> {
     tx.execute(
         "UPDATE metadata SET value=CAST(value AS INTEGER)+1 WHERE key='memory_revision'",
         [],
     )
     .map_err(db_error)?;
-    tx.execute("DELETE FROM metadata WHERE key='summary'", [])
-        .map_err(db_error)?;
-    // Raw history remains visible, but historical preferences before this boundary are not authoritative.
-    tx.execute("INSERT INTO metadata(key,value) VALUES ('memory_history_floor',(SELECT CAST(COALESCE(MAX(id),0) AS TEXT) FROM messages)) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[]).map_err(db_error)?;
-    Ok(())
+    // Keep both committed coverage and recent original messages. Corrections are
+    // supplied separately so old summary statements cannot override current data.
+    append_context_change(tx, change)
 }
 fn db_error(error: rusqlite::Error) -> String {
     format!("本地数据库操作失败：{error}")
@@ -732,6 +1028,268 @@ fn db_error(error: rusqlite::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn context_snapshot_never_silently_caps_raw_history() {
+        let db = store();
+        for i in 0..250 {
+            db.add_message("user", &format!("message {i}")).unwrap();
+        }
+        db.set_meta("summary", "legacy summary").unwrap();
+        db.set_meta("processed_through", "200").unwrap();
+        let snapshot = db.context_snapshot().unwrap();
+        assert_eq!(snapshot.messages.len(), 250);
+        assert_eq!(snapshot.through, 0);
+        assert_eq!(snapshot.summary, "legacy summary");
+    }
+
+    #[test]
+    fn compaction_commits_prefix_and_preserves_concurrent_append() {
+        let db = store();
+        let first = db.add_message("user", "今晚运动完成").unwrap();
+        let second = db.add_message("assistant", "好，继续聊游戏").unwrap();
+        let snapshot = db.context_snapshot().unwrap();
+        let newer = db.add_message("user", "新话题").unwrap();
+        assert!(db
+            .apply_context_compaction(
+                snapshot.revision,
+                snapshot.through,
+                second.id,
+                "今晚已运动，随后聊游戏",
+                &[]
+            )
+            .unwrap());
+        let after = db.context_snapshot().unwrap();
+        assert_eq!(after.summary, "今晚已运动，随后聊游戏");
+        assert_eq!(after.through, second.id);
+        assert_eq!(
+            after.messages.iter().map(|m| m.id).collect::<Vec<_>>(),
+            vec![newer.id]
+        );
+        assert!(db.messages().unwrap().iter().any(|m| m.id == first.id));
+        assert!(!db
+            .apply_context_compaction(
+                snapshot.revision,
+                snapshot.through,
+                newer.id,
+                "过时结果",
+                &[]
+            )
+            .unwrap());
+    }
+
+    #[test]
+    fn compaction_rejects_invalid_empty_and_cleared_snapshots() {
+        let db = store();
+        let first = db.add_message("user", "原话").unwrap();
+        let snapshot = db.context_snapshot().unwrap();
+        for (through, summary) in [(first.id, ""), (0, "摘要"), (first.id + 100, "摘要")] {
+            assert!(db
+                .apply_context_compaction(
+                    snapshot.revision,
+                    snapshot.through,
+                    through,
+                    summary,
+                    &[]
+                )
+                .is_err());
+        }
+        assert_eq!(db.context_snapshot().unwrap().messages.len(), 1);
+        db.clear_conversation().unwrap();
+        assert!(!db
+            .apply_context_compaction(snapshot.revision, snapshot.through, first.id, "旧对话", &[])
+            .unwrap());
+        let current = db.context_snapshot().unwrap();
+        assert!(current.messages.is_empty());
+        assert!(current.summary.is_empty());
+        assert_eq!(current.through, 0);
+    }
+
+    #[test]
+    fn remembering_new_fact_preserves_context_and_rejects_stale_compaction() {
+        let db = store();
+        let old = db.add_message("user", "今晚运动完成").unwrap();
+        let initial = db.context_snapshot().unwrap();
+        assert!(db
+            .apply_context_compaction(initial.revision, 0, old.id, "今晚已经运动", &[])
+            .unwrap());
+        let recent = db.add_message("user", "现在聊游戏").unwrap();
+        let in_flight = db.context_snapshot().unwrap();
+        db.add_memory_scoped("喜欢玩游戏", "long_term").unwrap();
+        let after = db.context_snapshot().unwrap();
+        assert_eq!(after.summary, in_flight.summary);
+        assert_eq!(after.through, old.id);
+        assert_eq!(after.floor, in_flight.floor);
+        assert_eq!(
+            after.messages.iter().map(|m| m.id).collect::<Vec<_>>(),
+            vec![recent.id]
+        );
+        assert!(after.revision > in_flight.revision);
+        assert!(!db
+            .apply_context_compaction(
+                in_flight.revision,
+                in_flight.through,
+                recent.id,
+                "过时摘要",
+                &[]
+            )
+            .unwrap());
+    }
+
+    #[test]
+    fn profile_edit_preserves_summary_boundary_and_rejects_stale_work() {
+        let db = store();
+        let first = db.add_message("user", "今晚运动完成").unwrap();
+        let snapshot = db.context_snapshot().unwrap();
+        assert!(db
+            .apply_context_compaction(snapshot.revision, 0, first.id, "今晚已运动", &[])
+            .unwrap());
+        let recent = db.add_message("user", "现在聊游戏").unwrap();
+        let before = db.context_snapshot().unwrap();
+        db.save_user_profile("每天提醒运动", 0).unwrap();
+        let after = db.context_snapshot().unwrap();
+        assert_eq!(after.summary, before.summary);
+        assert_eq!(after.through, first.id);
+        assert_eq!(after.floor, before.floor);
+        assert_eq!(
+            after.messages.iter().map(|m| m.id).collect::<Vec<_>>(),
+            vec![recent.id]
+        );
+        assert!(!db
+            .apply_context_compaction(before.revision, before.through, recent.id, "过时摘要", &[])
+            .unwrap());
+    }
+
+    #[test]
+    fn summary_versions_are_atomic_bounded_and_clear_with_conversation() {
+        let db = store();
+        for i in 0..35 {
+            let message = db.add_message("user", &format!("第{i}次对话")).unwrap();
+            let snapshot = db.context_snapshot().unwrap();
+            assert!(db
+                .apply_context_compaction(
+                    snapshot.revision,
+                    snapshot.through,
+                    message.id,
+                    &format!("近期状态{i}"),
+                    &[]
+                )
+                .unwrap());
+            // Stale commits cannot add audit entries.
+            assert!(!db
+                .apply_context_compaction(
+                    snapshot.revision,
+                    snapshot.through,
+                    message.id,
+                    "过期",
+                    &[]
+                )
+                .unwrap());
+        }
+        {
+            let conn = db.lock().unwrap();
+            assert_eq!(
+                conn.query_row("SELECT COUNT(*) FROM summary_versions", [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                30
+            );
+            let entry: (String,String,i64,i64,i64,i64) = conn.query_row("SELECT previous_summary,summary,previous_through,through,before_tokens,after_tokens FROM summary_versions ORDER BY id DESC LIMIT 1", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).unwrap();
+            assert_eq!(entry.0, "近期状态33");
+            assert_eq!(entry.1, "近期状态34");
+            assert_eq!(entry.3, entry.2 + 1);
+            assert!(entry.4 > entry.5 && entry.5 > 0);
+        }
+        db.clear_conversation().unwrap();
+        assert_eq!(
+            db.lock()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM summary_versions", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn corrections_survive_stale_work_and_fold_only_on_valid_commit() {
+        let db = store();
+        let message = db.add_message("user", "今天已完成").unwrap();
+        let before = db.context_snapshot().unwrap();
+        db.save_user_profile("每日提醒", 0).unwrap();
+        assert!(!db
+            .apply_context_compaction(before.revision, 0, message.id, "过时", &[])
+            .unwrap());
+        assert!(db
+            .memory_context_changes()
+            .unwrap()
+            .contains("profile_updated"));
+        let current = db.context_snapshot().unwrap();
+        assert!(db
+            .apply_context_compaction(current.revision, 0, message.id, "今天已完成，不再提醒", &[])
+            .unwrap());
+        assert_eq!(db.memory_context_changes().unwrap(), "[]");
+    }
+
+    #[test]
+    fn corrections_survive_partial_prefix_until_old_raw_tail_is_covered() {
+        let db = store();
+        let first = db.add_message("user", "旧偏好在前缀").unwrap();
+        let last = db.add_message("user", "旧偏好也在尾部").unwrap();
+        db.save_user_profile("新偏好", 0).unwrap();
+        let snapshot = db.context_snapshot().unwrap();
+        assert!(db
+            .apply_context_compaction(snapshot.revision, 0, first.id, "按新偏好整理", &[])
+            .unwrap());
+        assert!(db
+            .memory_context_changes()
+            .unwrap()
+            .contains("profile_updated"));
+        let snapshot = db.context_snapshot().unwrap();
+        assert!(db
+            .apply_context_compaction(snapshot.revision, first.id, last.id, "按新偏好整理", &[])
+            .unwrap());
+        assert_eq!(db.memory_context_changes().unwrap(), "[]");
+    }
+
+    #[test]
+    fn correction_injection_is_bounded_for_profiles_and_bulk_expiry() {
+        let db = store();
+        let mut revision = 0;
+        for i in 0..25 {
+            let profile = format!("{}{}", "🙂".repeat(990), i);
+            revision = db.save_user_profile(&profile, revision).unwrap().revision;
+        }
+        let profile_hints = db.memory_context_changes().unwrap();
+        assert!(!profile_hints.contains("🙂"));
+        assert!(
+            tiktoken_rs::o200k_base_singleton()
+                .encode_ordinary(&profile_hints)
+                .len()
+                <= 800
+        );
+        for i in 0..30 {
+            db.add_memory_scoped(&format!("{}{}", "过期关注".repeat(400), i), "today")
+                .unwrap();
+        }
+        db.lock()
+            .unwrap()
+            .execute("UPDATE memories SET expires_at='2000-01-01T00:00:00Z'", [])
+            .unwrap();
+        assert_eq!(db.expire_memories().unwrap(), 30);
+        let hints = db.memory_context_changes().unwrap();
+        assert!(
+            tiktoken_rs::o200k_base_singleton()
+                .encode_ordinary(&hints)
+                .len()
+                <= 800
+        );
+        assert!(hints.contains("omitted"));
+        assert!(hints.contains("expired"));
+        assert!(hints.contains("truncated"));
+        let value: Value = serde_json::from_str(&hints).unwrap();
+        assert_eq!(value["changes"][0]["omitted_memories"], 26);
+    }
+
     #[test]
     fn last_user_time_ignores_observations_beyond_context_window() {
         let db = store();
@@ -965,7 +1523,7 @@ mod tests {
         assert_eq!(db.messages_after(1, 10).unwrap().len(), 1);
     }
     #[test]
-    fn explicit_changes_reject_stale_batches_and_invalidate_summary() {
+    fn explicit_changes_preserve_context_and_reject_stale_batches() {
         let db = store();
         let memory = db.add_memory("看左边").unwrap();
         let revision = db.memory_revision().unwrap();
@@ -975,8 +1533,10 @@ mod tests {
             .apply_memory_batch(revision, &["看左边".into()], "旧摘要", 10)
             .unwrap());
         assert_eq!(db.memories().unwrap()[0].content, "看右边");
-        assert!(db.get_meta("summary").unwrap().is_none());
+        assert_eq!(db.get_meta("summary").unwrap().as_deref(), Some("看左边"));
+        assert!(db.memory_context_changes().unwrap().contains("看右边"));
         db.delete_memory(memory.id).unwrap();
+        assert!(db.memory_context_changes().unwrap().contains("removed"));
         assert!(db.memories().unwrap().is_empty());
     }
     #[test]
@@ -1026,7 +1586,7 @@ mod tests {
     }
 
     #[test]
-    fn today_expiry_invalidates_summary_history_and_stale_batch() {
+    fn today_expiry_preserves_continuity_and_rejects_stale_batch() {
         let db = store();
         db.add_message("user", "今天看左边").unwrap();
         let memory = db.add_memory_scoped("今天看左边", "today").unwrap();
@@ -1044,11 +1604,13 @@ mod tests {
         assert_eq!(db.expire_memories().unwrap(), 1);
         assert_eq!(db.expire_memories().unwrap(), 0);
         assert!(db.memories().unwrap().is_empty());
-        assert!(db.get_meta("summary").unwrap().is_none());
         assert_eq!(
-            db.get_meta("memory_history_floor").unwrap().as_deref(),
-            Some("1")
+            db.get_meta("summary").unwrap().as_deref(),
+            Some("用户今天关注左边")
         );
+        assert!(db.get_meta("memory_history_floor").unwrap().is_none());
+        assert!(db.memory_context_changes().unwrap().contains("expired"));
+        assert_eq!(db.context_snapshot().unwrap().messages.len(), 1);
         assert!(!db
             .apply_memory_batch(revision, &["看左边".into()], "旧摘要", 1)
             .unwrap());
@@ -1071,7 +1633,11 @@ mod tests {
             let db = Store::open(&path).unwrap();
             assert_eq!(db.memories().unwrap().len(), 1);
             assert_eq!(db.memories().unwrap()[0].scope, "long_term");
-            assert!(db.get_meta("summary").unwrap().is_none());
+            assert_eq!(
+                db.get_meta("summary").unwrap().as_deref(),
+                Some("这次关注右上角")
+            );
+            assert!(db.memory_context_changes().unwrap().contains("expired"));
         }
         std::fs::remove_file(path).unwrap();
     }

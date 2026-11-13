@@ -1,4 +1,5 @@
 //! Non-streaming speech adapters. Credentials belong only on the configured synthesis request.
+use crate::request_retry::{self, RequestError};
 use crate::settings::{validate_tts_endpoint, TtsProfile};
 use reqwest::{Client, Response};
 use serde::Deserialize;
@@ -106,7 +107,7 @@ fn request_body(provider: &str, profile: &TtsProfile, text: &str) -> Value {
     }
 }
 
-async fn read_bounded(mut response: Response, max: usize) -> Result<Vec<u8>, String> {
+async fn read_bounded(mut response: Response, max: usize) -> Result<Vec<u8>, RequestError> {
     if response
         .content_length()
         .is_some_and(|length| length > max as u64)
@@ -114,7 +115,11 @@ async fn read_bounded(mut response: Response, max: usize) -> Result<Vec<u8>, Str
         return Err("语音接口响应过大，已停止下载".into());
     }
     let mut bytes = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|_| "语音响应下载中断")? {
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| request_retry::transport(error, "语音响应下载中断"))?
+    {
         if chunk.len() > max.saturating_sub(bytes.len()) {
             return Err("语音接口响应过大，已停止下载".into());
         }
@@ -123,13 +128,19 @@ async fn read_bounded(mut response: Response, max: usize) -> Result<Vec<u8>, Str
     Ok(bytes)
 }
 
-fn checked_status(response: Response) -> Result<Response, String> {
+async fn checked_status(response: Response) -> Result<Response, RequestError> {
     if !response.status().is_success() {
-        // Do not echo provider-controlled bodies/URLs which can contain credentials or text.
-        return Err(format!(
+        let retryable = request_retry::http_retryable(&response);
+        let message = format!(
             "TTS API HTTP {}：请检查连接、Key、模型和音色配置",
             response.status().as_u16()
-        ));
+        );
+        crate::api::log_http_error(response, "tts").await;
+        return Err(if retryable {
+            request_retry::transient(message)
+        } else {
+            message.into()
+        });
     }
     Ok(response)
 }
@@ -210,21 +221,42 @@ pub async fn synthesize(
     if text.trim().is_empty() || text.chars().count() > 4096 {
         return Err("单次语音合成文本须为 1–4096 个字符".into());
     }
+    crate::diagnostics::register_secret(key);
     let client = Client::builder()
         .connect_timeout(Duration::from_secs(15))
         .timeout(Duration::from_secs(120))
         .redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never())
         .build()
         .map_err(|_| "无法创建语音服务连接")?;
-    let response = checked_status(
-        client
-            .post(endpoint.trim())
-            .bearer_auth(key)
-            .json(&request_body(provider, profile, text))
-            .send()
-            .await
-            .map_err(|_| "语音服务连接失败或超时，请检查完整接口地址和网络")?,
-    )?;
+    let body = request_body(provider, profile, text);
+    let bytes = request_retry::run("tts_synthesis", || async {
+        let response = checked_status(
+            client
+                .post(endpoint.trim())
+                .bearer_auth(key)
+                .json(&body)
+                .send()
+                .await
+                .map_err(|error| {
+                    request_retry::transport(
+                        error,
+                        "语音服务连接失败或超时，请检查完整接口地址和网络",
+                    )
+                })?,
+        )
+        .await?;
+        read_bounded(
+            response,
+            if provider == "openai" {
+                MAX_AUDIO_BYTES
+            } else {
+                MAX_JSON_BYTES
+            },
+        )
+        .await
+    })
+    .await?;
     let mut audio = SpeechAudio {
         bytes: Vec::new(),
         format: profile.format.clone(),
@@ -232,11 +264,23 @@ pub async fn synthesize(
         channels: 1,
     };
     if provider == "openai" {
-        audio.bytes = read_bounded(response, MAX_AUDIO_BYTES).await?;
+        audio.bytes = bytes;
     } else {
-        let value: Value = serde_json::from_slice(&read_bounded(response, MAX_JSON_BYTES).await?)
-            .map_err(|_| "语音服务返回了无效的 JSON 响应")?;
-        check_provider_error(&value, provider)?;
+        let value: Value = serde_json::from_slice(&bytes).map_err(|error| {
+            crate::diagnostics::record(
+                "error",
+                "tts",
+                "parse_error",
+                json!({"error":error.to_string(),"response_bytes":bytes.len()}),
+            );
+            "语音服务返回了无效的 JSON 响应"
+        })?;
+        check_provider_error(&value, provider).inspect_err(|_| {
+            crate::diagnostics::record("error", "tts", "provider_error", json!({
+                "provider":provider,"code":value["code"],"message":value["message"],
+                "error":value["error"],"request_id":value["request_id"],"base_resp":value["output"]["base_resp"]
+            }));
+        })?;
         if provider == "cosyvoice" {
             let url = value["output"]["audio"]["url"]
                 .as_str()
@@ -251,14 +295,17 @@ pub async fn synthesize(
                 return Err("音频下载地址必须为无凭据的 HTTP(S) 地址".into());
             }
             // Signed storage URLs may contain query parameters. Never attach the synthesis key.
-            let response = checked_status(
-                client
-                    .get(parsed)
-                    .send()
-                    .await
-                    .map_err(|_| "音频下载失败或超时")?,
-            )?;
-            audio.bytes = read_bounded(response, MAX_AUDIO_BYTES).await?;
+            // Retry only the returned download, never submit synthesis again after success.
+            audio.bytes =
+                request_retry::run("tts_download", || async {
+                    let response =
+                        checked_status(client.get(parsed.clone()).send().await.map_err(
+                            |error| request_retry::transport(error, "音频下载失败或超时"),
+                        )?)
+                        .await?;
+                    read_bounded(response, MAX_AUDIO_BYTES).await
+                })
+                .await?;
         } else {
             let hex = value["output"]["data"]["audio"]
                 .as_str()
@@ -362,6 +409,136 @@ mod tests {
         });
         (format!("http://{address}/tts"), handle)
     }
+    fn sequence_mock(
+        responses: Vec<(&'static str, &'static str, Vec<u8>)>,
+    ) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            let mut deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(5)))
+                            .unwrap();
+                        let mut request = Vec::new();
+                        let mut buffer = [0_u8; 4096];
+                        loop {
+                            let n = stream.read(&mut buffer).unwrap();
+                            if n == 0 {
+                                break;
+                            }
+                            request.extend_from_slice(&buffer[..n]);
+                            if let Some(end) = request.windows(4).position(|v| v == b"\r\n\r\n") {
+                                let header = String::from_utf8_lossy(&request[..end]);
+                                let length = header
+                                    .lines()
+                                    .find_map(|line| {
+                                        line.to_lowercase()
+                                            .strip_prefix("content-length:")
+                                            .map(|s| s.trim().parse::<usize>().unwrap())
+                                    })
+                                    .unwrap_or(0);
+                                if request.len() >= end + 4 + length {
+                                    break;
+                                }
+                            }
+                        }
+                        let (status, headers, body) =
+                            &responses[requests.len().min(responses.len() - 1)];
+                        write!(stream,"HTTP/1.1 {status}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n",body.len()).unwrap();
+                        stream.write_all(body).unwrap();
+                        requests.push(String::from_utf8(request).unwrap());
+                        deadline = std::time::Instant::now() + Duration::from_millis(200);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if std::time::Instant::now() >= deadline {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("{error}"),
+                }
+            }
+            requests
+        });
+        (format!("http://{address}/tts"), handle)
+    }
+
+    #[tokio::test]
+    async fn synthesis_retries_transient_failures_at_most_twice() {
+        for recover in [true, false] {
+            let mut responses = vec![("503 Service Unavailable", "", b"temporary".to_vec()); 3];
+            if recover {
+                responses[2] = ("200 OK", "", b"RIFF-recovered".to_vec());
+            }
+            let (url, server) = sequence_mock(responses);
+            let result = synthesize(&url, "test-key", "openai", &profile("openai"), "你好").await;
+            if recover {
+                assert_eq!(result.unwrap().bytes, b"RIFF-recovered");
+            } else {
+                assert!(result.unwrap_err().contains("503"));
+            }
+            let requests = server.join().unwrap();
+            assert_eq!(requests.len(), 3);
+            assert!(requests
+                .iter()
+                .all(|request| body(request)["input"] == "你好"));
+        }
+    }
+
+    #[tokio::test]
+    async fn permanent_errors_and_retry_after_do_not_retry() {
+        for (status, headers, body) in [
+            ("400 Bad Request", "", "{}"),
+            ("401 Unauthorized", "", "{}"),
+            ("429 Too Many Requests", "", "{}"),
+            ("503 Service Unavailable", "Retry-After: 10\r\n", "{}"),
+            ("200 OK", "", r#"{"code":"InvalidParameter"}"#),
+        ] {
+            let (url, server) = sequence_mock(vec![(status, headers, body.as_bytes().to_vec())]);
+            assert!(
+                synthesize(&url, "test-key", "cosyvoice", &profile("cosyvoice"), "你好")
+                    .await
+                    .is_err()
+            );
+            assert_eq!(server.join().unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn cosy_download_retries_without_resynthesizing_or_forwarding_key() {
+        let (audio_url, download) = sequence_mock(vec![
+            ("502 Bad Gateway", "", Vec::new()),
+            ("502 Bad Gateway", "", Vec::new()),
+            ("200 OK", "", b"RIFF-recovered".to_vec()),
+        ]);
+        let (url, synthesis) = sequence_mock(vec![(
+            "200 OK",
+            "",
+            json!({"output":{"audio":{"url":audio_url}}})
+                .to_string()
+                .into_bytes(),
+        )]);
+        let audio = synthesize(&url, "test-key", "cosyvoice", &profile("cosyvoice"), "你好")
+            .await
+            .unwrap();
+        assert_eq!(audio.bytes, b"RIFF-recovered");
+        assert_eq!(synthesis.join().unwrap().len(), 1);
+        let requests = download.join().unwrap();
+        assert_eq!(requests.len(), 3);
+        for request in requests {
+            assert!(request.starts_with("GET "));
+            assert!(!request.to_lowercase().contains("authorization"));
+            assert!(!request.contains("test-key"));
+        }
+    }
+
     fn body(request: &str) -> Value {
         serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap()
     }
@@ -467,6 +644,7 @@ mod tests {
         assert!(read_bounded(response, 8)
             .await
             .unwrap_err()
+            .message
             .contains("过大"));
         server.join().unwrap();
     }

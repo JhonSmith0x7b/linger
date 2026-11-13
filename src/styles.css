@@ -1567,3 +1567,34 @@ html.orb-document, .orb-document body, .orb-document #root { margin: 0; min-widt
 .microphone-status { color: #52735f; font-size: 13px; }
 .microphone-status.preparing { color: #75664b; }
 .microphone-status.error { color: #a3493c; }
+
+/* Transient capture feedback is painted only: it never takes focus or pointer input. */
+.orb-capture-notice { position: absolute; z-index: 6; left: var(--notice-x, 4px); top: var(--notice-y, 4px); max-width: 184px; height: 24px; box-sizing: border-box; padding: 4px 8px; border-radius: 8px; background: #eef9f3f5; color: #2d715d; box-shadow: 0 1px 4px #20301820; font-size: 11px; line-height: 16px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; pointer-events: none; }
+.orb-capture-notice.capture-started { background: #f0edf8f5; color: #76628f; }
+.orb-capture-notice.capture-failed { background: #fff0e3f5; color: #a34f2e; }
+.orb-capture-notice.capture-historical { background: #edf2faf5; color: #536f97; }
+.companion-orb.capture-started .orb-ring { border-color: transparent; border-top-color: #8c72b3; border-right-color: #8c72b350; animation: orb-spin .9s linear infinite; }
+.companion-orb.capture-captured .orb-ring { border-color: #4cbd9e; animation: orb-notice .65s ease-out 2; }
+.companion-orb.capture-historical .orb-ring { border-color: #7c9dcc; animation: orb-notice .65s ease-out 2; }
+.companion-orb.capture-failed .orb-ring { border-color: #d58b55; animation: orb-notice .65s ease-out 2; }
+@media (prefers-reduced-motion: reduce) { .companion-orb.capture-started .orb-ring, .companion-orb.capture-captured .orb-ring, .companion-orb.capture-historical .orb-ring, .companion-orb.capture-failed .orb-ring { animation: none; } }
+
+/* Local diagnostics: only this bounded page polls for new entries. */
+/* Plain-text developer console: preserve raw lines and manual text selection. */
+.logs-page .page-heading { margin-bottom: 14px; }
+.logs-toolbar, .logs-confirm { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-bottom: 12px; }
+.logs-toolbar label { display: flex; align-items: center; gap: 7px; font-size: 13px; margin-right: auto; }
+.logs-confirm { padding: 10px 12px; background: #fff5e7; border: 1px solid #ecd9ba; border-radius: 6px; font-size: 13px; }
+.logs-confirm > span { flex: 1 1 200px; }
+.logs-console, .logs-error { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; font-size: 12px; line-height: 1.65; tab-size: 2; user-select: text; }
+.logs-console { margin: 0; padding: 14px; min-height: 320px; height: calc(100vh - 270px); max-height: 900px; overflow: auto; white-space: pre; background: #191d21; color: #dce2e8; border: 1px solid #343c44; border-radius: 6px; scrollbar-gutter: stable; }
+.logs-error { margin: 0 0 12px; padding: 10px; white-space: pre-wrap; overflow-wrap: anywhere; color: #a13d33; background: #fff0ec; border: 1px solid #e8c2bc; border-radius: 4px; }
+
+.music-settings { display: grid; gap: 16px; }
+.music-controls { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.music-controls input { min-width: 180px; max-width: 100%; }
+.music-instructions { padding-left: 22px; line-height: 1.8; color: var(--text-secondary, #64736b); }
+.music-candidate { display: flex; align-items: center; gap: 10px; padding: 12px 0; border-bottom: 1px solid var(--border, #dce4dd); }
+.music-candidate > div { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.music-candidate small { display: block; margin-top: 5px; opacity: .7; }
+.music-result { max-height: 260px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; }

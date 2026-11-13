@@ -1,3 +1,4 @@
+use crate::request_retry::{self, RequestError};
 use reqwest::{multipart, Client, Response, Url};
 use serde_json::{json, Value};
 use std::{collections::BTreeMap, time::Duration};
@@ -142,6 +143,75 @@ fn validate_complete_item(item: &Value) -> Result<(), String> {
     Ok(())
 }
 
+const MAX_ERROR_BODY: usize = 16 * 1024;
+
+/// Preserve the provider's error and request identifier without recording request content.
+pub(crate) async fn log_http_error(mut response: Response, category: &str) -> Vec<u8> {
+    let status = response.status().as_u16();
+    let request_id = response
+        .headers()
+        .get("x-request-id")
+        .or_else(|| response.headers().get("request-id"))
+        .or_else(|| response.headers().get("x-dashscope-request-id"))
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let mut bytes = Vec::new();
+    let mut truncated = false;
+    let mut read_error = None;
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                let remaining = MAX_ERROR_BODY - bytes.len();
+                bytes.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+                if chunk.len() > remaining || bytes.len() == MAX_ERROR_BODY {
+                    truncated = true;
+                    break;
+                }
+            }
+            Ok(None) => break,
+            Err(error) => {
+                read_error = Some(format!("{error:?}"));
+                break;
+            }
+        }
+    }
+    let body = error_body_for_log(&bytes, truncated);
+    crate::diagnostics::record(
+        "error",
+        category,
+        "http_error",
+        json!({
+            "status":status, "request_id":request_id, "body":body,
+            "body_truncated":truncated, "read_error":read_error
+        }),
+    );
+    bytes
+}
+
+fn error_body_for_log(bytes: &[u8], truncated: bool) -> String {
+    let mut body = crate::diagnostics::redact(&String::from_utf8_lossy(bytes));
+    if truncated {
+        body.push_str("\n[truncated: error body limited to 16384 bytes]");
+    }
+    body
+}
+
+fn log_stream_error(event: &Value) {
+    // The response output can contain media or a complete conversation; retain error fields only.
+    crate::diagnostics::record(
+        "error",
+        "responses",
+        "stream_error",
+        json!({
+            "type":event["type"], "response_id":event["response"]["id"],
+            "error":event.get("error").or_else(||event.pointer("/response/error")),
+            "code":event["code"], "message":event["message"],
+            "incomplete_details":event["response"]["incomplete_details"],
+            "usage":event["response"]["usage"]
+        }),
+    );
+}
+
 /// OpenAI protocol client. The configured base URL includes `/v1` (or a proxy prefix).
 /// Dropping an in-flight future cancels local consumption; callers still discard late turns.
 #[derive(Clone)]
@@ -167,7 +237,9 @@ impl Api {
         if key.is_empty() || key.contains(['\r', '\n']) {
             return Err("请先设置有效的 API Key".into());
         }
+        crate::diagnostics::register_secret(key);
         let client = Client::builder()
+            .retry(reqwest::retry::never())
             .connect_timeout(Duration::from_secs(15))
             .timeout(Duration::from_secs(120))
             // Do not forward a credential or user media to a redirected destination.
@@ -189,6 +261,9 @@ impl Api {
 
     /// IDs describe availability, not endpoint capabilities; proxy aliases are preserved.
     pub async fn list_models(&self) -> Result<Vec<String>, String> {
+        request_retry::run("models", || self.list_models_once()).await
+    }
+    async fn list_models_once(&self) -> Result<Vec<String>, RequestError> {
         let response = self
             .checked(
                 self.client
@@ -199,10 +274,19 @@ impl Api {
                     .await,
             )
             .await?;
-        let value: Value = response
-            .json()
+        let bytes = response
+            .bytes()
             .await
-            .map_err(|_| "模型列表不是有效 JSON，请检查中转兼容性".to_string())?;
+            .map_err(|e| request_retry::transport(e, "模型列表下载中断"))?;
+        let value: Value = serde_json::from_slice(&bytes).map_err(|error| {
+            crate::diagnostics::record(
+                "error",
+                "models",
+                "parse_error",
+                json!({"error":error.to_string(),"response_bytes":bytes.len()}),
+            );
+            "模型列表不是有效 JSON，请检查中转兼容性"
+        })?;
         let data = value["data"]
             .as_array()
             .ok_or("服务未返回 models.data 列表，请检查 API 地址及中转兼容性")?;
@@ -222,21 +306,23 @@ impl Api {
     async fn checked(
         &self,
         response: Result<Response, reqwest::Error>,
-    ) -> Result<Response, String> {
+    ) -> Result<Response, RequestError> {
         let response = response.map_err(|error| {
-            if error.is_timeout() {
-                "API 请求超时，请重试".to_string()
+            let message = if error.is_timeout() {
+                "API 请求超时，请重试"
             } else if error.is_connect() {
-                "无法连接 API，请检查地址与网络".to_string()
+                "无法连接 API，请检查地址与网络"
             } else {
-                "API 网络请求失败".to_string()
-            }
+                "API 网络请求失败"
+            };
+            request_retry::transport(error, message)
         })?;
         if response.status().is_success() {
             return Ok(response);
         }
+        let retryable = request_retry::http_retryable(&response);
         let status = response.status().as_u16();
-        let bytes = response.bytes().await.unwrap_or_default();
+        let bytes = log_http_error(response, "api").await;
         let parsed: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
         // Only show a bounded structured message, never raw HTML or request bodies.
         let message = parsed
@@ -244,10 +330,25 @@ impl Api {
             .and_then(Value::as_str)
             .unwrap_or("服务拒绝请求，请检查模型、Key 或中转兼容性")
             .replace(&self.key, "[已隐藏]");
-        Err(format!(
-            "API {status}：{}",
-            message.chars().take(500).collect::<String>()
-        ))
+        let code = parsed
+            .pointer("/error/code")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let retryable = retryable
+            && !matches!(
+                code,
+                "insufficient_quota"
+                    | "invalid_api_key"
+                    | "invalid_request_error"
+                    | "context_length_exceeded"
+            );
+        Err(RequestError {
+            retryable,
+            message: format!(
+                "API {status}：{}",
+                message.chars().take(500).collect::<String>()
+            ),
+        })
     }
 
     pub async fn response(
@@ -262,7 +363,8 @@ impl Api {
             .await
     }
 
-    /// Deltas are provisional. Tools are released only after successful completion.
+    /// Deltas are provisional. An empty callback resets the draft before a retry.
+    /// Tools are released only after successful completion.
     pub async fn response_stream<F: FnMut(&str) + Send>(
         &self,
         model: &str,
@@ -275,8 +377,38 @@ impl Api {
         let body = json!({"model":model,"instructions":instructions,"input":input,
             "tools":tools,"max_output_tokens":max_output,"store":false,"stream":true,
             "include":["reasoning.encrypted_content"]});
+        let mut trace = crate::diagnostics::RequestTrace::new("responses");
+        for attempt in 0..request_retry::MAX_ATTEMPTS {
+            match self
+                .response_stream_once(&body, max_output, &mut on_delta)
+                .await
+            {
+                Ok(value) => {
+                    trace.success(attempt + 1, value.get("usage"));
+                    return Ok(value);
+                }
+                Err(error) if error.retryable && attempt + 1 < request_retry::MAX_ATTEMPTS => {
+                    trace.retry(attempt + 1, &error.message);
+                    // Empty delta is an explicit draft reset before replaying this request.
+                    on_delta("");
+                }
+                Err(error) => {
+                    trace.failure(attempt + 1, &error.message);
+                    return Err(error.message);
+                }
+            }
+        }
+        unreachable!()
+    }
+
+    async fn response_stream_once<F: FnMut(&str) + Send>(
+        &self,
+        body: &Value,
+        max_output: u32,
+        on_delta: &mut F,
+    ) -> Result<Value, RequestError> {
         let mut response = self
-            .checked(self.post("responses").json(&body).send().await)
+            .checked(self.post("responses").json(body).send().await)
             .await?;
         let mut pending = Vec::new();
         let mut data_lines = Vec::<String>::new();
@@ -286,7 +418,7 @@ impl Api {
         while let Some(chunk) = response
             .chunk()
             .await
-            .map_err(|_| "对话流传输中断".to_string())?
+            .map_err(|e| request_retry::transport(e, "对话流传输中断"))?
         {
             add_stream_bytes(&mut total_bytes, chunk.len(), MAX_STREAM_BYTES)?;
             pending.extend_from_slice(&chunk);
@@ -305,25 +437,53 @@ impl Api {
                     if data == "[DONE]" {
                         continue;
                     }
-                    let event: Value =
-                        serde_json::from_str(&data).map_err(|_| "对话流事件格式错误")?;
+                    let event: Value = serde_json::from_str(&data).map_err(|error| {
+                        crate::diagnostics::record(
+                            "error",
+                            "responses",
+                            "parse_error",
+                            json!({"error":error.to_string(),"event_bytes":data.len()}),
+                        );
+                        "对话流事件格式错误"
+                    })?;
                     match event["type"].as_str().unwrap_or("") {
                         "response.output_text.delta" => {
                             if let Some(delta) = event["delta"].as_str() {
-                                on_delta(delta);
+                                if !delta.is_empty() {
+                                    on_delta(delta);
+                                }
                             }
                         }
                         "response.output_item.added" | "response.output_item.done" => {
                             outputs.collect(&event)?;
                         }
                         "response.completed" => {
-                            return outputs.complete(event["response"].clone(), max_output);
+                            return outputs
+                                .complete(event["response"].clone(), max_output)
+                                .map_err(Into::into);
                         }
                         "response.incomplete" => {
-                            return Err(incomplete_response_error(&event["response"], max_output))
+                            log_stream_error(&event);
+                            return Err(
+                                incomplete_response_error(&event["response"], max_output).into()
+                            );
                         }
                         "response.failed" | "error" => {
-                            return Err("模型流式请求失败，请检查所选模型或中转兼容性".into())
+                            log_stream_error(&event);
+                            let code = event
+                                .pointer("/response/error/code")
+                                .or_else(|| event.pointer("/error/code"))
+                                .or_else(|| event.get("code"))
+                                .and_then(Value::as_str)
+                                .unwrap_or("");
+                            let message = "模型流式请求失败，请检查所选模型或中转兼容性";
+                            return Err(
+                                if matches!(code, "server_error" | "internal_server_error") {
+                                    request_retry::transient(message)
+                                } else {
+                                    message.into()
+                                },
+                            );
                         }
                         _ => {}
                     }
@@ -336,14 +496,18 @@ impl Api {
                 return Err(STREAM_LIMIT_ERROR.into());
             }
         }
-        Err("对话流提前结束，未收到完成事件".into())
+        Err(request_retry::transient("对话流提前结束，未收到完成事件"))
     }
 
     pub async fn transcribe(&self, model: &str, wav: Vec<u8>) -> Result<String, String> {
         if wav.len() <= 44 {
             return Err("录音为空，请按住按钮说话后松开".into());
         }
-        let file = multipart::Part::bytes(wav)
+        request_retry::run("asr", || self.transcribe_once(model, &wav)).await
+    }
+
+    async fn transcribe_once(&self, model: &str, wav: &[u8]) -> Result<String, RequestError> {
+        let file = multipart::Part::bytes(wav.to_vec())
             .file_name("recording.wav")
             .mime_str("audio/wav")
             .map_err(|_| "无法构造录音上传".to_string())?;
@@ -359,10 +523,19 @@ impl Api {
                     .await,
             )
             .await?;
-        let value: Value = response
-            .json()
+        let bytes = response
+            .bytes()
             .await
-            .map_err(|_| "转写接口返回格式不正确".to_string())?;
+            .map_err(|e| request_retry::transport(e, "转写响应下载中断"))?;
+        let value: Value = serde_json::from_slice(&bytes).map_err(|error| {
+            crate::diagnostics::record(
+                "error",
+                "asr",
+                "parse_error",
+                json!({"error":error.to_string(),"response_bytes":bytes.len()}),
+            );
+            "转写接口返回格式不正确"
+        })?;
         let text = value["text"].as_str().ok_or("转写接口没有返回文本")?.trim();
         Ok(text.to_owned())
     }
@@ -435,6 +608,19 @@ fn incomplete_response_error(response: &Value, limit: u32) -> String {
 mod tests {
     use super::*;
     #[test]
+    fn raw_error_log_preserves_provider_message_but_redacts_key() {
+        let key = "unique-diagnostic-test-credential";
+        crate::diagnostics::register_secret(key);
+        let body = format!(
+            r#"{{"error":{{"message":"context length 7231 exceeds 6000; key={key}","code":"context_length_exceeded"}}}}"#
+        );
+        let logged = error_body_for_log(body.as_bytes(), true);
+        assert!(logged.contains("context length 7231 exceeds 6000"));
+        assert!(logged.contains("context_length_exceeded"));
+        assert!(logged.contains("[truncated:"));
+        assert!(!logged.contains(key));
+    }
+    #[test]
     fn validates_endpoint_and_preserves_proxy_prefix() {
         let api = Api::new("http://192.168.1.2:3000/proxy/v1/", "test-key").unwrap();
         assert_eq!(api.base, "http://192.168.1.2:3000/proxy/v1");
@@ -447,6 +633,167 @@ mod tests {
             assert!(Api::new(url, "key").is_err());
         }
         assert!(Api::new("https://api.openai.com/v1", "").is_err());
+    }
+
+    // Serve exactly the expected attempts; finite deadlines prevent hanging CI on regressions.
+    fn retry_server(
+        replies: Vec<(u16, &'static str, String)>,
+    ) -> (String, std::thread::JoinHandle<Vec<Vec<u8>>>) {
+        use std::{
+            io::{Read, Write},
+            net::TcpListener,
+            time::Instant,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let handle = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for (status, headers, body) in replies {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline, "missing retry");
+                            std::thread::sleep(Duration::from_millis(2));
+                        }
+                        Err(e) => panic!("{e}"),
+                    }
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut bytes = [0; 8192];
+                    let n = stream.read(&mut bytes).unwrap();
+                    assert!(n > 0);
+                    request.extend_from_slice(&bytes[..n]);
+                    if let Some(end) = request.windows(4).position(|b| b == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&request[..end]);
+                        let length = head
+                            .lines()
+                            .find_map(|l| {
+                                let (name, value) = l.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap_or(0);
+                        if request.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                write!(stream, "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n{headers}\r\n{body}", body.len()).unwrap();
+                requests.push(request);
+            }
+            requests
+        });
+        (url, handle)
+    }
+
+    fn completed_stream() -> String {
+        format!(
+            "data: {{\"type\":\"response.output_text.delta\",\"delta\":\"new\"}}\n\ndata: {}\n\n",
+            json!({"type":"response.completed","response":{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"new"}]}]}})
+        )
+    }
+
+    #[tokio::test]
+    async fn retries_only_failed_request_and_resets_partial_stream() {
+        let partial = format!(
+            "data: {}\n\ndata: {}\n\n",
+            json!({"type":"response.output_text.delta","delta":"old"}),
+            json!({"type":"response.output_item.done","output_index":0,"item":{"id":"fc_test","type":"function_call","name":"remember","call_id":"unfinished","arguments":"{}","status":"completed"}})
+        );
+        let (url, server) = retry_server(vec![
+            (200, "", partial),
+            (502, "", "{}".into()),
+            (200, "", completed_stream()),
+        ]);
+        let mut draft = String::new();
+        let mut resets = 0;
+        let input = json!([{"type":"function_call_output","call_id":"existing","output":"already executed"}]);
+        let result = Api::new(&url, "fake-key")
+            .unwrap()
+            .response_stream("m", "role", input.clone(), json!([]), 100, |delta| {
+                if delta.is_empty() {
+                    draft.clear();
+                    resets += 1;
+                } else {
+                    draft.push_str(delta);
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(draft, "new");
+        assert_eq!(resets, 2);
+        assert!(result["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|v| v["type"] != "function_call"));
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 3);
+        for request in requests {
+            assert_eq!(
+                request_body(&String::from_utf8_lossy(&request))["input"],
+                input
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_cap_and_permanent_http_errors() {
+        let (url, server) = retry_server(vec![(503, "", "{}".into()); 3]);
+        let mut resets = 0;
+        let error = Api::new(&url, "fake-key")
+            .unwrap()
+            .response_stream("m", "", json!([]), json!([]), 100, |_| resets += 1)
+            .await
+            .unwrap_err();
+        assert!(error.contains("503"));
+        assert_eq!(resets, 2);
+        assert_eq!(server.join().unwrap().len(), 3);
+        for (status, headers, body) in [
+            (400, "", "{}"),
+            (401, "", "{}"),
+            (429, "", "{}"),
+            (503, "Retry-After: 1\r\n", "{}"),
+            (500, "", r#"{"error":{"code":"insufficient_quota"}}"#),
+        ] {
+            let (url, server) = retry_server(vec![(status, headers, body.into())]);
+            let mut resets = 0;
+            assert!(Api::new(&url, "fake-key")
+                .unwrap()
+                .response_stream("m", "", json!([]), json!([]), 100, |_| resets += 1)
+                .await
+                .is_err());
+            assert_eq!(resets, 0);
+            assert_eq!(server.join().unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn asr_retries_with_same_audio() {
+        let (url, server) = retry_server(vec![
+            (502, "", "{}".into()),
+            (200, "", r#"{"text":"hello"}"#.into()),
+        ]);
+        let wav = b"RIFF-test-original-audio-payload-reused-on-every-attempt".to_vec();
+        let text = Api::new(&url, "fake-key")
+            .unwrap()
+            .transcribe("asr-model", wav.clone())
+            .await
+            .unwrap();
+        assert_eq!(text, "hello");
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        for request in requests {
+            assert!(request.windows(wav.len()).any(|part| part == wav));
+        }
     }
 
     fn mock(

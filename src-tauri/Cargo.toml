@@ -1,6 +1,6 @@
 [package]
 name = "linger"
-version = "0.1.27"
+version = "0.1.28"
 description = "A quiet desktop AI companion"
 edition = "2021"
 
@@ -27,5 +27,6 @@ hound = "3.5"
 xcap = "0.9.9"
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
 base64 = "0.22"
+getrandom = "0.2"
 
 tiktoken-rs = "0.12"

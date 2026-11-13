@@ -9,6 +9,15 @@ import type { Message, Settings, Status, MicrophoneStatus } from "./types";
 
 type Placement = { width: number; height: number; orb_x: number; orb_y: number; panel_x: number; panel_y: number; panel_width: number; panel_height: number; controls_left: boolean };
 
+type CaptureEvent = { phase: "started" | "captured" | "failed" | "historical"; automatic: boolean; at: string; captured_at: string | null; detail: string };
+type CaptureNotice = { phase: CaptureEvent["phase"]; text: string };
+const captureTime = (value: string, seconds = false) => {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "时间未知";
+  const day = date.toDateString() === new Date().toDateString() ? "" : `${date.toLocaleDateString("zh-CN", { month: "numeric", day: "numeric" })} `;
+  return day + date.toLocaleTimeString("zh-CN", { hour12: false, hour: "2-digit", minute: "2-digit", ...(seconds ? { second: "2-digit" as const } : {}) });
+};
+
 type Mode = "orb" | "tools" | "chat" | "translate" | "more" | "bubble";
 const phaseNames: Record<string, string> = { idle: "在这里陪你", preparing_recording: "麦克风准备中…", recording: "正在听 · 再点麦克风发送", transcribing: "正在识别语音", thinking: "正在想一想", generating: "正在回应", observing: "看看你的屏幕", playing: "正在说话", speaking: "正在说话", synthesizing: "准备说给你听", stopped: "已停止", error: "有件事需要留意", tool: "正在使用工具" };
 
@@ -23,6 +32,13 @@ export function FloatingPanel({ settings, messages, streamText, ready, status, m
   const [bubble, setBubble] = useState("");
   const [level, setLevel] = useState(0);
   const [observingPulse, setObservingPulse] = useState(false);
+  const [captureNotice, setCaptureNotice] = useState<CaptureNotice | null>(null);
+  const captureTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const captureStartTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const captureEpoch = useRef(0);
+  const surfaceMode = useRef<string>("");
+  const captureNoticeRef = useRef<CaptureNotice | null>(null);
+  captureNoticeRef.current = captureNotice;
   const observeTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const [text, setText] = useState("");
   const [translationStyle, setTranslationStyle] = useState(settings.translation_style);
@@ -62,6 +78,17 @@ export function FloatingPanel({ settings, messages, streamText, ready, status, m
   const voiceButtonLabel = captureFailed ? "麦克风中断 · 点击结束" : voicePending ? "麦克风准备中 · 再点取消" : voiceEngaged ? "停止录音并发送" : "开始录音";
   const label = captureFailed ? microphone.detail : voicePending ? "麦克风准备中…" : phaseNames[status.phase] || status.detail;
 
+  const syncLayout = useCallback((next: string) => {
+    if (surfaceMode.current === next) return;
+    surfaceMode.current = next;
+    layoutQueue.current = layoutQueue.current.catch(() => {}).then(async () => {
+      if (surfaceMode.current !== next) return;
+      if (isTauri()) {
+        const nextPlacement = await invoke<Placement>("compact_set_layout", { mode: next });
+        if (surfaceMode.current === next && nextPlacement) setPlacement(nextPlacement);
+      }
+    }).catch(() => setError("悬浮界面尺寸调整失败，请重新打开悬浮球。"));
+  }, []);
   const changeMode = useCallback((next: Mode) => {
     clearTimeout(hideTimer.current);
     if (next === "orb") {
@@ -73,15 +100,11 @@ export function FloatingPanel({ settings, messages, streamText, ready, status, m
       voiceActive.current = false; setVoiceRecording(false); stopRef.current();
     }
     modeRef.current = next; setMode(next);
-    layoutQueue.current = layoutQueue.current.catch(() => {}).then(async () => {
-      // Skip queued intermediate hover layouts when a card has already been opened.
-      if (modeRef.current !== next) return;
-      if (isTauri()) {
-        const nextPlacement = await invoke<Placement>("compact_set_layout", { mode: next });
-        if (modeRef.current === next && nextPlacement) setPlacement(nextPlacement);
-      }
-    }).catch(() => setError("悬浮界面尺寸调整失败，请重新打开悬浮球。"));
-  }, []);
+    syncLayout(next === "orb" && captureNoticeRef.current ? "notice" : next);
+  }, [syncLayout]);
+  useEffect(() => {
+    syncLayout(mode === "orb" && captureNotice ? "notice" : mode);
+  }, [mode, captureNotice, syncLayout]);
   useEffect(() => {
     if (mode !== "translate" && mode !== "chat" && mode !== "more") return;
     let cancelled = false;
@@ -152,10 +175,47 @@ export function FloatingPanel({ settings, messages, streamText, ready, status, m
     return () => { disposed = true; cleanup?.(); };
   }, [changeMode]);
   useEffect(() => {
-    if (status.phase !== "observing") return;
-    setObservingPulse(true);
-    clearTimeout(observeTimer.current);
-    observeTimer.current = setTimeout(() => setObservingPulse(false), 1300);
+    let disposed = false;
+    let cleanup: (() => void) | undefined;
+    if (isTauri()) void listen<CaptureEvent>("linger:screen-capture", ({ payload }) => {
+      if (disposed) return;
+      const epoch = ++captureEpoch.current;
+      clearTimeout(captureStartTimer.current);
+      clearTimeout(captureTimer.current);
+      if (press.current?.dragging || suppressDragHover.current) { setCaptureNotice(null); return; }
+      if (payload.automatic) {
+        if (payload.phase === "captured") {
+          setObservingPulse(true);
+          clearTimeout(observeTimer.current);
+          observeTimer.current = setTimeout(() => setObservingPulse(false), 1300);
+        }
+        if (payload.phase !== "failed") { setCaptureNotice(null); return; }
+      }
+      if (payload.phase === "started") {
+        setCaptureNotice(null);
+        // Fast captures complete before this appears; never delay capture itself.
+        captureStartTimer.current = setTimeout(() => {
+          if (captureEpoch.current === epoch) setCaptureNotice({ phase: "started", text: "正在截图…" });
+        }, 150);
+        return;
+      }
+      const text = payload.phase === "captured" ? `已截图 · ${captureTime(payload.captured_at || payload.at, true)}`
+        : payload.phase === "historical" ? `回看 · ${captureTime(payload.captured_at || "")} 的截图`
+        : `截图失败${payload.detail ? ` · ${payload.detail}` : ""}`;
+      setCaptureNotice({ phase: payload.phase, text });
+      captureTimer.current = setTimeout(() => {
+        if (captureEpoch.current === epoch) setCaptureNotice(null);
+      }, payload.phase === "failed" ? 4000 : 2000);
+    }).then(unlisten => { if (disposed) unlisten(); else cleanup = unlisten; });
+    return () => {
+      disposed = true; cleanup?.(); ++captureEpoch.current;
+      clearTimeout(captureTimer.current); clearTimeout(captureStartTimer.current);
+    };
+  }, []);
+  useEffect(() => {
+    if (!["stopped", "idle", "error", "recording", "preparing_recording"].includes(status.phase)) return;
+    clearTimeout(captureStartTimer.current);
+    setCaptureNotice(current => current?.phase === "started" ? null : current);
   }, [status.phase]);
   useEffect(() => {
     if (status.phase !== "recording") setLevel(0);
@@ -277,6 +337,8 @@ export function FloatingPanel({ settings, messages, streamText, ready, status, m
     if (!active && suppressDragHover.current && event.buttons === 0) { hoverOrb(event); return; }
     if (!active || active.dragging || Math.hypot(event.screenX - active.x, event.screenY - active.y) < 6) return;
     active.dragging = true; suppressDragHover.current = true;
+    ++captureEpoch.current; clearTimeout(captureTimer.current); clearTimeout(captureStartTimer.current);
+    captureNoticeRef.current = null; setCaptureNotice(null);
     changeMode("orb");
     if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
     // Resize the actual native window before handing movement to the OS, otherwise
@@ -308,8 +370,11 @@ export function FloatingPanel({ settings, messages, streamText, ready, status, m
     "--panel-width": `${placement.panel_width}px`, "--panel-height": `${placement.panel_height}px`,
     "--translate-x": `${placement.orb_x + (placement.controls_left ? -48 : 48)}px`,
     "--tools-x": `${placement.orb_x + (placement.controls_left ? -72 : 72)}px`,
+    "--notice-x": `${Math.max(4, Math.min(placement.width - 188, placement.orb_x - 164))}px`,
+    "--notice-y": `${placement.orb_y >= 58 ? placement.orb_y - 56 : placement.orb_y + 32}px`,
   } as CSSProperties : undefined;
   return <div ref={layer} className={`companion-layer mode-${mode} ${placement?.controls_left === false ? "controls-right" : "controls-left"}`} style={positionStyle} onPointerEnter={() => { if (modeRef.current === "tools") clearTimeout(hideTimer.current); }} onPointerLeave={leave}>
+    {captureNotice && <div className={`orb-capture-notice capture-${captureNotice.phase}`} role="status" aria-live="polite" title={captureNotice.text}>{captureNotice.text}</div>}
     <button data-hit-region className="orb-translate-shortcut" title="快捷翻译" aria-label="快捷翻译" onClick={() => { if (modeRef.current === "translate") { void command("compact_focus").then(() => translationInput.current?.focus()); } else changeMode("translate"); }}>译</button>
 
     {mode === "tools" && <div data-hit-region className="orb-tools" aria-label="陪伴球操作">
@@ -367,7 +432,7 @@ export function FloatingPanel({ settings, messages, streamText, ready, status, m
     </form>}
     {mode === "translate" && result && <button className="orb-copy-button" onClick={() => void copy()}>{copied ? "✓ 已复制，可以粘贴了" : "复制译文"}</button>}
     </section>}
-    <button data-hit-region className={`companion-orb phase-${phase} ${settings.observing ? "observation-enabled" : ""} ${observingPulse ? "observing-pulse" : ""} ${companionError || error ? "with-error" : ""}`} aria-label={`陪伴球 · ${settings.observing ? "读屏陪伴已开启" : "读屏陪伴已暂停"} · ${label}，单击打字，双击打开主界面，拖动移动`} title={`${companionError || error || label} · ${settings.observing ? "读屏陪伴已开启" : "读屏陪伴已暂停"} · 单击打字 / 双击主界面 / 拖动移动`} disabled={!ready}
+    <button data-hit-region className={`companion-orb phase-${phase} ${settings.observing ? "observation-enabled" : ""} ${observingPulse ? "observing-pulse" : ""} ${captureNotice ? `capture-${captureNotice.phase}` : ""} ${companionError || error ? "with-error" : ""}`} aria-label={`陪伴球 · ${settings.observing ? "读屏陪伴已开启" : "读屏陪伴已暂停"} · ${label}，单击打字，双击打开主界面，拖动移动`} title={`${captureNotice?.text || companionError || error || label} · ${settings.observing ? "读屏陪伴已开启" : "读屏陪伴已暂停"} · 单击打字 / 双击主界面 / 拖动移动`} disabled={!ready}
       style={{ "--mic-level": level } as CSSProperties}
       onPointerEnter={hoverOrb}
       onDoubleClick={e => e.preventDefault()} onPointerDown={beginPress} onPointerMove={movePress} onPointerUp={() => endPress(true)} onPointerCancel={() => endPress(false)} onLostPointerCapture={() => { if (!press.current?.dragging) endPress(false); }} onContextMenu={e => { e.preventDefault(); changeMode("more"); }}
