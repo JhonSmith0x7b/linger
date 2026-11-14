@@ -34,7 +34,7 @@ export function pageAction(action, args) {
       position_seconds: Number.isFinite(video?.currentTime) ? video.currentTime : null,
       duration_seconds: Number.isFinite(video?.duration) ? video.duration : null,
       ready: !!player && !!bar && !!video,
-      synchronized: !!videoId && !!title && title === barTitle,
+      title_matches: !!videoId && !!title && title === barTitle,
       queue_count: queueIds().length,
       document_focused: document.hasFocus(), visibility: document.visibilityState,
     };
@@ -42,8 +42,17 @@ export function pageAction(action, args) {
   if (action === 'status') return status();
   if (action === 'search_start') {
     const previousQuery = new URL(location.href).searchParams.get('q');
-    const previousIds = [...document.querySelectorAll('ytmusic-search-page ytmusic-responsive-list-item-renderer')]
-      .slice(0, 100).map(row => idOf(row.querySelector('ytmusic-play-button-renderer'))).filter(Boolean).slice(0, 8);
+    // Keep one bounded snapshot across MAIN-world invocations. Song IDs alone
+    // cannot prove freshness: different queries can legitimately return the same songs.
+    const searchKey = Symbol.for('linger.music.search');
+    const searchRows = [...document.querySelectorAll('ytmusic-search-page ytmusic-responsive-list-item-renderer')].slice(0, 100);
+    const priorSearch = document[searchKey];
+    document[searchKey] = {
+      token: args.search_token, query: args.query, deadline: args.__deadline_ms,
+      fresh: previousQuery === args.query && !(priorSearch?.query === args.query && !priorSearch.fresh),
+      rows: searchRows.map(node => ({ node, data: node.data, controllerData: node.controllerProxy?.data,
+        id: idOf(node.querySelector('ytmusic-play-button-renderer')), text: clean(node.textContent) })),
+    };
     const input = document.querySelector('ytmusic-search-box input');
     const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
     if (!input || !setter) throw Error('未找到站内搜索框；请在已登录的 YouTube Music 页面重试');
@@ -55,7 +64,8 @@ export function pageAction(action, args) {
     for (const type of ['keydown', 'keypress', 'keyup']) input.dispatchEvent(new KeyboardEvent(type, {
       key: 'Enter', code: 'Enter', keyCode: 13, charCode: type === 'keypress' ? 13 : 0, which: 13, bubbles: true, cancelable: true, composed: true,
     }));
-    return { submitted: true, previous_query: previousQuery, previous_ids: previousIds };
+    return { submitted: true, previous_query: previousQuery,
+      document_focused: document.hasFocus(), visibility: document.visibilityState };
   }
   const rows = [...document.querySelectorAll('ytmusic-search-page ytmusic-responsive-list-item-renderer')].slice(0, 100);
   const rowId = row => idOf(row.querySelector('ytmusic-play-button-renderer')) || (() => {
@@ -64,12 +74,27 @@ export function pageAction(action, args) {
   })();
   if (action === 'search_read') {
     const url = new URL(location.href);
-    if (url.pathname !== '/search' || url.searchParams.get('q') !== args.query) return { ready: false, candidates: [] };
+    const snapshot = document[Symbol.for('linger.music.search')];
+    const tracked = args.search_token && snapshot?.token === args.search_token && snapshot.query === args.query && snapshot.deadline > Date.now();
+    if (tracked && !snapshot.fresh && url.pathname === '/search' && url.searchParams.get('q') === args.query) {
+      // Polymer may reuse a row node while replacing its renderer data. Check
+      // both identities plus content, never assume a changed URL refreshed rows.
+      snapshot.fresh = rows.some(node => visible(node) && !snapshot.rows.some(old =>
+        old.node === node && old.data === node.data && old.controllerData === node.controllerProxy?.data &&
+        old.id === idOf(node.querySelector('ytmusic-play-button-renderer')) && old.text === clean(node.textContent)));
+      if (snapshot.fresh) snapshot.rows = [];
+    }
+    const diagnostics = {
+      results_fresh: !!tracked && snapshot.fresh,
+      document_focused: document.hasFocus(), visibility: document.visibilityState,
+      search_page: url.pathname === '/search', query_matches: url.searchParams.get('q') === args.query,
+    };
+    if (!diagnostics.search_page || !diagnostics.query_matches) return { ready: false, candidates: [], ...diagnostics };
     const seen = new Set();
     const candidates = [];
     for (const row of rows) {
       const videoId = rowId(row);
-      if (!videoId || seen.has(videoId) || !row.querySelector('ytmusic-play-button-renderer')) continue;
+      if (!visible(row) || !videoId || seen.has(videoId) || !row.querySelector('ytmusic-play-button-renderer')) continue;
       seen.add(videoId);
       const detail = clean(row.textContent);
       candidates.push({
@@ -78,7 +103,7 @@ export function pageAction(action, args) {
       });
       if (candidates.length === 8) break;
     }
-    return { ready: candidates.length > 0, candidates };
+    return { ready: candidates.length > 0, candidates, ...diagnostics };
   }
   if (['play', 'queue_open', 'queue_click'].includes(action)) {
     const url = new URL(location.href);
@@ -133,4 +158,17 @@ export function pageAction(action, args) {
     return { issued: true };
   }
   throw Error('不支持的音乐操作');
+}
+
+// A localized/bilingual bottom-bar title can differ from getVideoData().title.
+// Titles remain diagnostics; playback is proved by ID and advancing media time.
+export function playbackConfirmed(state, previous, expectedId) {
+  return !!expectedId && state.video_id === expectedId && state.paused === false && state.player_state === 1 &&
+    previous?.video_id === expectedId && Number.isFinite(state.position_seconds) &&
+    Number.isFinite(previous.position_seconds) && state.position_seconds > previous.position_seconds;
+}
+
+export function searchConfirmed(state, previous) {
+  return !!(state.ready && state.results_fresh && previous?.ready && previous.results_fresh &&
+    JSON.stringify(state.candidates) === JSON.stringify(previous.candidates));
 }

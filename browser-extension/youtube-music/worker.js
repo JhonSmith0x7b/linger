@@ -1,4 +1,4 @@
-import { pageAction } from './page.js';
+import { pageAction, playbackConfirmed, searchConfirmed } from './page.js';
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 let busy = false;
 let loopRunning = false;
@@ -6,6 +6,7 @@ let timer;
 let lastConnection = '';
 const actions = new Set(['search', 'play', 'pause', 'resume', 'next', 'status', 'queue']);
 const errorText = error => String(error?.message || error).slice(0, 500);
+const extensionVersion = chrome.runtime.getManifest().version;
 async function settings() { return (await chrome.storage.local.get('settings')).settings; }
 async function note(event, detail = {}) {
   const { logs = [] } = await chrome.storage.local.get('logs');
@@ -49,7 +50,13 @@ async function until(tabId, action, args, accept, seconds = 18, commandDeadline 
     if (accept(current, previous)) return current;
     previous = current;
   }
-  throw Error('已发送操作，但未能确认结果；请查询播放状态，不要直接重复操作');
+  // Whitelist only operational state: no search terms, titles, URLs or credentials.
+  const evidence = previous ? Object.fromEntries([
+    'document_focused', 'visibility', 'search_page', 'query_matches',
+    'results_fresh', 'ready', 'title_matches', 'paused', 'player_state', 'position_seconds',
+  ].filter(key => previous[key] !== undefined).map(key => [key, previous[key]])) : {};
+  if (action === 'search_read') evidence.candidate_count = previous?.candidates?.length ?? 0;
+  throw Error(`未能确认音乐操作结果；phase=${action} state=${JSON.stringify(evidence)}；请先查询状态，不要直接重复操作`);
 }
 async function execute(config, action, args = {}) {
   if (!actions.has(action)) throw Error('不支持的音乐操作');
@@ -62,10 +69,9 @@ async function execute(config, action, args = {}) {
     const query = String(args.query || '').trim();
     if (!query || Array.from(query).length > 200) throw Error('搜索词不能为空且最多 200 字');
     await chrome.storage.local.remove('candidates');
-    const started = await invoke('search_start', { query });
-    const previousIds = JSON.stringify(started.previous_ids);
-    const result = await verify('search_read', { query }, state => state.ready &&
-      (started.previous_query === query || JSON.stringify(state.candidates.map(item => item.video_id)) !== previousIds), 18);
+    const search_token = crypto.randomUUID();
+    await invoke('search_start', { query, search_token });
+    const result = await verify('search_read', { query, search_token }, searchConfirmed, 18);
     await chrome.storage.local.set({ candidates: result.candidates, candidateTab: config.tabId, candidateQuery: query });
     return { query, candidates: result.candidates };
   }
@@ -84,30 +90,30 @@ async function execute(config, action, args = {}) {
       return { queued: true, video_id: id, playing: result };
     }
     await invoke('play', selected);
-    return verify('status', {}, (state, previous) =>
-      state.video_id === id && state.synchronized && state.paused === false && state.player_state === 1 &&
-      previous?.video_id === id && state.position_seconds > previous.position_seconds);
+    const result = await verify('status', {}, (state, previous) =>
+      playbackConfirmed(state, previous, id));
+    return { ...result, playback_confirmed: true };
   }
   await invoke(action);
-  return verify('status', {}, (state, previous) => {
+  const result = await verify('status', {}, (state, previous) => {
     if (action === 'pause') return state.paused === true && state.player_state === 2;
-    if (action === 'resume') return state.paused === false && state.player_state === 1 && state.synchronized &&
-      previous && state.position_seconds > previous.position_seconds;
-    return state.video_id && state.video_id !== before.video_id && state.synchronized && state.paused === false &&
-      previous?.video_id === state.video_id && state.position_seconds > previous.position_seconds;
+    if (action === 'resume') return playbackConfirmed(state, previous, before.video_id);
+    return state.video_id !== before.video_id && playbackConfirmed(state, previous, state.video_id);
   });
+  return { ...result, ...(action === 'pause' ? { pause_confirmed: true } : { playback_confirmed: true }) };
 }
 async function run(config, action, args) {
   if (busy) throw Error('音乐操作进行中，请等待完成');
   busy = true;
   try {
-    await note('开始', { action });
+    await note('开始', { action, extension_version: extensionVersion });
     const result = await execute(config, action, args);
     await note('完成', { action, result });
     return result;
   } catch (error) {
-    await note('失败', { action, error: errorText(error) });
-    throw error;
+    const message = `扩展 ${extensionVersion} / ${action}：${errorText(error)}`;
+    await note('失败', { action, error: message });
+    throw Error(message);
   } finally { busy = false; }
 }
 async function poll() {

@@ -273,9 +273,164 @@ fn remember_position(
     .map_err(|e| e.to_string())
 }
 
+// AppKit treats z-order and full-screen Spaces as separate policies. A floating
+// window alone stays behind another application's full-screen Space.
+#[cfg(any(target_os = "macos", test))]
+fn fullscreen_collection_behavior(current: usize) -> usize {
+    const CAN_JOIN_ALL_SPACES: usize = 1 << 0;
+    const MOVE_TO_ACTIVE_SPACE: usize = 1 << 1;
+    const MANAGED: usize = 1 << 2;
+    const TRANSIENT: usize = 1 << 3;
+    const STATIONARY: usize = 1 << 4;
+    const FULL_SCREEN_PRIMARY: usize = 1 << 7;
+    const FULL_SCREEN_AUXILIARY: usize = 1 << 8;
+    const FULL_SCREEN_NONE: usize = 1 << 9;
+    const PRIMARY: usize = 1 << 16;
+    const AUXILIARY: usize = 1 << 17;
+    // Available since macOS 13; Linger's deployment target is macOS 14.
+    const CAN_JOIN_ALL_APPLICATIONS: usize = 1 << 18;
+    (current
+        & !(MOVE_TO_ACTIVE_SPACE
+            | MANAGED
+            | TRANSIENT
+            | FULL_SCREEN_PRIMARY
+            | FULL_SCREEN_NONE
+            | PRIMARY
+            | AUXILIARY))
+        | CAN_JOIN_ALL_SPACES
+        | STATIONARY
+        | FULL_SCREEN_AUXILIARY
+        | CAN_JOIN_ALL_APPLICATIONS
+}
+
+// The macOS overlay is a nonactivating NSPanel, not a normal NSWindow.
+// Keep the original Tauri delegate for focus/close events and restore the native
+// class before Tauri tears down its windows. The pinned plugin owns conversion.
+#[cfg(target_os = "macos")]
+mod native_panel {
+    use tauri_nspanel::objc2_app_kit::{NSWindowCollectionBehavior, NSWindowStyleMask};
+    use tauri_nspanel::{tauri_panel, ManagerExt, PanelLevel, WebviewWindowExt};
+
+    tauri_panel! {
+        panel!(LingerCompanionPanel {
+            config: {
+                can_become_key_window: true,
+                can_become_main_window: false,
+                is_floating_panel: true
+            }
+        })
+    }
+
+    pub fn with_panel(
+        window: &tauri::WebviewWindow,
+        action: impl FnOnce(tauri_nspanel::PanelHandle<tauri::Wry>) -> Result<(), String>
+            + Send
+            + 'static,
+    ) -> Result<(), String> {
+        let native_window = window.clone();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        window
+            .run_on_main_thread(move || {
+                let result = (|| {
+                    let panel = match native_window.get_webview_panel("compact") {
+                        Ok(panel) => panel,
+                        Err(_) => {
+                            let panel = native_window
+                                .to_panel::<LingerCompanionPanel>()
+                                .map_err(|e| e.to_string())?;
+                            panel.set_released_when_closed(false);
+                            panel.set_hides_on_deactivate(false);
+                            panel.set_becomes_key_only_if_needed(false);
+                            panel.set_level(PanelLevel::Dock.value());
+                            panel
+                                .add_style_mask(NSWindowStyleMask::NonactivatingPanel)
+                                .map_err(|e| e.to_string())?;
+                            panel.set_collection_behavior(
+                                NSWindowCollectionBehavior::from_bits_retain(
+                                    super::fullscreen_collection_behavior(
+                                        panel.as_panel().collectionBehavior().bits(),
+                                    ),
+                                ),
+                            );
+                            panel
+                        }
+                    };
+                    action(panel)
+                })();
+                let _ = tx.send(result);
+            })
+            .map_err(|e| e.to_string())?;
+        // Tauri executes this closure immediately on the main thread, otherwise
+        // queues it there. Wait so configuration errors reach the caller.
+        rx.recv().map_err(|e| e.to_string())?
+    }
+
+    pub fn show(window: &tauri::WebviewWindow) -> Result<(), String> {
+        with_panel(window, |panel| {
+            // orderFrontRegardless does not activate Linger or switch Spaces.
+            panel.show();
+            log_state(&panel, "shown");
+            Ok(())
+        })
+    }
+
+    fn log_state(panel: &tauri_nspanel::PanelHandle<tauri::Wry>, phase: &str) {
+        let native = panel.as_panel();
+        crate::diagnostics::record(
+            "info",
+            "overlay",
+            "native_panel_state",
+            serde_json::json!({
+                "phase": phase,
+                "class": native.class().name().to_string_lossy(),
+                "is_panel": native.isKindOfClass(NSPanel::class()),
+                "nonactivating": native.styleMask().contains(NSWindowStyleMask::NonactivatingPanel),
+                "behavior": native.collectionBehavior().bits(),
+                "level": native.level(),
+                "visible": native.isVisible(),
+                "on_active_space": native.isOnActiveSpace(),
+                "hides_on_deactivate": native.hidesOnDeactivate(),
+            }),
+        );
+    }
+
+    pub fn diagnose(app: &tauri::AppHandle, phase: &'static str) {
+        let handle = app.clone();
+        let _ = app.run_on_main_thread(move || {
+            if let Ok(panel) = handle.get_webview_panel("compact") {
+                log_state(&panel, phase);
+            }
+        });
+    }
+
+    pub fn restore(app: &tauri::AppHandle) {
+        // Called by RunEvent on the main thread, before native window teardown.
+        if let Ok(panel) = app.get_webview_panel("compact") {
+            panel.to_window();
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub fn restore_native_panel(app: &tauri::AppHandle) {
+    native_panel::restore(app);
+}
+
+#[cfg(target_os = "macos")]
+pub fn diagnose_native_panel(app: &tauri::AppHandle, phase: &'static str) {
+    native_panel::diagnose(app, phase);
+}
+
+fn show_overlay_window(window: &tauri::WebviewWindow) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    return native_panel::show(window);
+    #[cfg(not(target_os = "macos"))]
+    window.show().map_err(|e| e.to_string())
+}
+
 pub fn show(app: &tauri::AppHandle) -> Result<(), String> {
     if let Some(window) = app.get_webview_window("compact") {
-        return window.show().map_err(|e| e.to_string());
+        return show_overlay_window(&window);
     }
     let mut builder = tauri::WebviewWindowBuilder::new(
         app,
@@ -336,8 +491,7 @@ pub fn show(app: &tauri::AppHandle) -> Result<(), String> {
             }
         }
     }
-    window.show().map_err(|e| e.to_string())?;
-    Ok(())
+    show_overlay_window(&window)
 }
 
 #[tauri::command]
@@ -412,10 +566,14 @@ pub fn compact_drag(app: tauri::AppHandle) -> Result<(), String> {
 }
 #[tauri::command]
 pub fn compact_focus(app: tauri::AppHandle) -> Result<(), String> {
-    app.get_webview_window("compact")
-        .ok_or("陪伴球尚未打开")?
-        .set_focus()
-        .map_err(|e| e.to_string())
+    let window = app.get_webview_window("compact").ok_or("陪伴球尚未打开")?;
+    #[cfg(target_os = "macos")]
+    return native_panel::with_panel(&window, |panel| {
+        panel.make_key_window();
+        Ok(())
+    });
+    #[cfg(not(target_os = "macos"))]
+    window.set_focus().map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -539,6 +697,19 @@ pub fn start_hit_testing(app: tauri::AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fullscreen_policy_preserves_unrelated_flags_and_removes_conflicts() {
+        let unrelated = (1 << 6) | (1 << 12);
+        let conflicts =
+            (1 << 1) | (1 << 2) | (1 << 3) | (1 << 7) | (1 << 9) | (1 << 16) | (1 << 17);
+        let expected = unrelated | (1 << 0) | (1 << 4) | (1 << 8) | (1 << 18);
+        assert_eq!(
+            fullscreen_collection_behavior(unrelated | conflicts),
+            expected
+        );
+        assert_eq!(fullscreen_collection_behavior(expected), expected);
+    }
     #[test]
     fn saved_ball_position_handles_display_changes_and_invalid_values() {
         let p = SavedPosition {

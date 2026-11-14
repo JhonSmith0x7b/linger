@@ -21,15 +21,17 @@ const captureTime = (value: string, seconds = false) => {
 type Mode = "orb" | "tools" | "chat" | "translate" | "more" | "bubble";
 const phaseNames: Record<string, string> = { idle: "在这里陪你", preparing_recording: "麦克风准备中…", recording: "正在听 · 再点麦克风发送", transcribing: "正在识别语音", thinking: "正在想一想", generating: "正在回应", observing: "看看你的屏幕", playing: "正在说话", speaking: "正在说话", synthesizing: "准备说给你听", stopped: "已停止", error: "有件事需要留意", tool: "正在使用工具" };
 
-export function FloatingPanel({ settings, messages, streamText, ready, status, microphone, recordingRequested, error: companionError, onStartRecording, onStopRecording, onToggleObserving, sourceControls, observationBusy, onSetTranslationAutoCopy }: {
+export function FloatingPanel({ settings, messages, streamText, ready, status, microphone, recordingRequested, error: companionError, onDismissError, onStartRecording, onStopRecording, onToggleObserving, sourceControls, observationBusy, onSetTranslationAutoCopy }: {
   settings: Settings; messages: Message[]; streamText: string; ready: boolean; status: Status; microphone: MicrophoneStatus; recordingRequested: boolean; error: string;
-  onSetTranslationAutoCopy: (enabled: boolean) => Promise<void>; onStartRecording: () => void; onStopRecording: () => void; onToggleObserving: () => void; sourceControls: ReactNode; observationBusy: boolean;
+  onDismissError: () => void; onSetTranslationAutoCopy: (enabled: boolean) => Promise<void>; onStartRecording: () => void; onStopRecording: () => void; onToggleObserving: () => void; sourceControls: ReactNode; observationBusy: boolean;
 }) {
   const [mode, setMode] = useState<Mode>("orb");
   const [placement, setPlacement] = useState<Placement | null>(null);
   const layer = useRef<HTMLDivElement>(null);
   const modeRef = useRef<Mode>("orb");
   const [bubble, setBubble] = useState("");
+  const [bubbleKind, setBubbleKind] = useState<"message" | "error" | "companion-error">("message");
+  const bubbleKindRef = useRef(bubbleKind);
   const [level, setLevel] = useState(0);
   const [observingPulse, setObservingPulse] = useState(false);
   const [captureNotice, setCaptureNotice] = useState<CaptureNotice | null>(null);
@@ -141,15 +143,15 @@ export function FloatingPanel({ settings, messages, streamText, ready, status, m
     void layoutQueue.current.then(publishRegions);
     return () => { disposed = true; observer.disconnect(); window.removeEventListener("resize", publishRegions); cancelAnimationFrame(frame); };
   }, [mode, speaking, placement]);
-  const showBubble = useCallback((message: string) => {
-    setBubble(message);
+  const showBubble = useCallback((message: string, kind: "message" | "error" | "companion-error" = "message") => {
+    setBubble(message); setBubbleKind(kind); bubbleKindRef.current = kind;
     if (["orb", "bubble"].includes(modeRef.current) && !press.current && !suppressDragHover.current && !voiceActive.current) {
       changeMode("bubble");
       hideTimer.current = setTimeout(() => changeMode("orb"), 8000);
     }
   }, [changeMode]);
   const command = async (name: string, args?: Record<string, unknown>) => {
-    try { await invoke(name, args); } catch (e) { setError(String(e)); showBubble(String(e)); }
+    try { await invoke(name, args); } catch (e) { setError(String(e)); showBubble(String(e), "error"); }
   };
   useEffect(() => {
     document.documentElement.classList.add("orb-document");
@@ -224,8 +226,21 @@ export function FloatingPanel({ settings, messages, streamText, ready, status, m
     }
   }, [status.phase, recordingRequested]);
   useEffect(() => {
-    if (companionError && !recordingRequested) showBubble(companionError);
-  }, [companionError, recordingRequested, showBubble]);
+    if (companionError && !recordingRequested) showBubble(companionError, "companion-error");
+    else if (!companionError && bubbleKindRef.current === "companion-error") {
+      setBubble(""); setBubbleKind("message"); bubbleKindRef.current = "message";
+      if (modeRef.current === "bubble") changeMode("orb");
+    }
+  }, [companionError, recordingRequested, showBubble, changeMode]);
+  useEffect(() => {
+    if (!["preparing_recording", "recording", "transcribing", "thinking", "observing", "idle", "stopped"].includes(status.phase)) return;
+    // A background conversation must not erase a translation form's own error.
+    if (modeRef.current !== "translate") setError("");
+    if (bubbleKindRef.current === "error") {
+      setBubble(""); setBubbleKind("message"); bubbleKindRef.current = "message";
+      if (modeRef.current === "bubble") changeMode("orb");
+    }
+  }, [status.phase, changeMode]);
   useEffect(() => {
     if (!ready) return;
     const last = messages.at(-1);
@@ -386,12 +401,18 @@ export function FloatingPanel({ settings, messages, streamText, ready, status, m
       </button>
       {speaking && <button title="停止播报" aria-label="停止播报" onClick={() => void command("interrupt")}>■</button>}
     </div>}
-    {mode === "bubble" && <div data-hit-region className={`orb-bubble ${companionError ? "has-error" : ""}`} role={companionError ? "alert" : "status"}>
-      <button className="orb-close" aria-label="收起提示" onClick={() => changeMode("orb")}>×</button><MarkdownText text={bubble || label} className="orb-bubble-text" />
+    {mode === "bubble" && <div data-hit-region className={`orb-bubble ${bubbleKind !== "message" ? "has-error" : ""}`} role={bubbleKind !== "message" ? "alert" : "status"}>
+      <button className="orb-close" aria-label={bubbleKind !== "message" ? "关闭错误" : "收起提示"} onClick={() => {
+        if (bubbleKind !== "message") { setError(""); onDismissError(); }
+        setBubble(""); setBubbleKind("message"); bubbleKindRef.current = "message";
+        changeMode("orb");
+      }}>×</button><MarkdownText text={bubble || label} className="orb-bubble-text" />
     </div>}
     {card && <section data-hit-region className="orb-card" aria-label={mode === "translate" ? "快捷翻译" : ["chat", "tools"].includes(mode) ? "最近对话" : "更多操作"}>
       <header><strong>{mode === "translate" ? "快捷翻译" : ["chat", "tools"].includes(mode) ? "最近对话" : "陪伴设置"}</strong><button className="orb-close" aria-label="收起面板" onClick={() => changeMode("orb")}>×</button></header>
-      {error && mode !== "translate" && <p className="translation-error orb-operation-error" role="alert">{error}</p>}
+      {(companionError || error) && mode !== "translate" && <p className="translation-error orb-operation-error" role="alert">
+        {companionError || error} <button type="button" aria-label="关闭错误" onClick={() => { setError(""); onDismissError(); }}>×</button>
+      </p>}
       {["chat", "tools"].includes(mode) ? <div className="orb-card-content floating-chat">
         {!messages.length && !streamText && <div className="orb-empty">点击麦克风按钮说话。<small>你也可以安心忙自己的事情。</small></div>}
         {messages.slice(mode === "tools" ? -6 : -30).map(m => <article key={m.id} className={`floating-message ${m.role === "user" ? "from-user" : ""}`}><small>{m.role === "user" ? "你 · 输入 / 语音转写" : m.role === "proactive" ? "主动陪伴" : "Linger"}</small>{m.role === "user" ? <p>{m.content}</p> : <MarkdownText text={m.content} />}</article>)}

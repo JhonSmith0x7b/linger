@@ -628,13 +628,32 @@ async fn run(
         );
     }
     let mut introduction_update = (false, false);
-    for _ in 0..5 {
+    // Keep the existing five tool-enabled rounds, then allow one response to
+    // explain their results without exposing any more tools.
+    for round in 0..=5 {
+        let final_response = round == 5;
+        let request_tools = if final_response {
+            json!([])
+        } else {
+            available_tools.clone()
+        };
+        let request_instructions = if final_response {
+            crate::diagnostics::record(
+                "info",
+                "turn",
+                "tool_budget_final_response",
+                json!({"turn_id":id,"tool_rounds":round}),
+            );
+            format!("{instructions}\n本轮工具执行额度已用完。现在根据已有工具结果直接回复用户，不再调用工具。明确区分已完成、失败和结果未确认的操作；不要将未确认写成成功，也不要要求用户为已完成的操作重复执行。保持当前角色及输出格式要求。")
+        } else {
+            instructions.clone()
+        };
         let result = api
             .response_stream(
                 &s.conversation_model,
-                &instructions,
+                &request_instructions,
                 json!(input),
-                available_tools.clone(),
+                request_tools,
                 if proactive { 2048 } else { 4096 },
                 |delta| {
                     let _gate = core.turn_gate.lock().unwrap();
@@ -744,6 +763,9 @@ async fn run(
                 report_observation(app, core, "replied", "观察完成，已生成陪伴回复");
             }
             return speak(app, core, &spoken, id, None).await.map(|_| ());
+        }
+        if final_response {
+            return Err("模型在本轮收尾时仍返回工具调用；未执行额外操作".into());
         }
         input.extend(outputs);
         for call in calls {
@@ -1032,7 +1054,7 @@ async fn run(
             return Err("本轮输入与工具结果超过上下文预算；未删除原始对话，请稍后重试或分步提问；已完成的工具操作不会撤销".into());
         }
     }
-    Err("本轮工具调用已达上限，请缩小问题范围后重试".into())
+    unreachable!("the final response returns without executing tools")
 }
 fn remove_images(input: &mut [Value]) {
     for item in input {

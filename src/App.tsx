@@ -215,6 +215,10 @@ export default function App() {
   const volumeRef = useRef(defaults.volume);
   const [capturingShortcut, setCapturingShortcut] = useState(false);
   const [error, setError] = useState("");
+  const dismissError = useCallback(() => {
+    setError("");
+    setStatus(current => current.phase === "error" ? { phase: "idle", detail: "在这里陪你" } : current);
+  }, []);
   const [notice, setNotice] = useState("");
   const [saving, setSaving] = useState(false);
   const [autoCopySaving, setAutoCopySaving] = useState(false);
@@ -390,7 +394,7 @@ export default function App() {
             )
               setStreamText("");
             if (payload.phase === "error") setError(payload.detail);
-            else if (payload.phase === "recording") setError("");
+            else if (["preparing_recording", "recording", "transcribing", "thinking", "observing", "idle", "stopped"].includes(payload.phase)) setError("");
           },
         );
         if (disposed) {
@@ -808,7 +812,7 @@ export default function App() {
   </>;
 
   if (compact)
-    return <FloatingPanel key={conversationEpoch} settings={settings} messages={messages} streamText={streamText} ready={ready} status={status} microphone={microphone} recordingRequested={held} error={error} onStartRecording={startRecording} onStopRecording={stopRecordingFromOrb} onToggleObserving={() => void toggleObserving()} observationBusy={observationBusy || sourceBusy} sourceControls={sourceControls} onSetTranslationAutoCopy={setTranslationAutoCopy} />;
+    return <FloatingPanel key={conversationEpoch} settings={settings} messages={messages} streamText={streamText} ready={ready} status={status} microphone={microphone} recordingRequested={held} error={error} onDismissError={dismissError} onStartRecording={startRecording} onStopRecording={stopRecordingFromOrb} onToggleObserving={() => void toggleObserving()} observationBusy={observationBusy || sourceBusy} sourceControls={sourceControls} onSetTranslationAutoCopy={setTranslationAutoCopy} />;
 
   return (
     <div className="app-shell">
@@ -887,7 +891,7 @@ export default function App() {
         {error && (
           <div role="alert" className="banner error">
             <span>{error}</span>
-            <button aria-label="关闭错误" onClick={() => setError("")}>
+            <button aria-label="关闭错误" onClick={dismissError}>
               <Icon name="close" size={16} />
             </button>
           </div>

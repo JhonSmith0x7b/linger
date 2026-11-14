@@ -1209,7 +1209,10 @@ fn register_shortcut(app: &tauri::AppHandle, shortcut: &str) -> Result<(), Strin
 }
 
 fn main() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    #[cfg(target_os = "macos")]
+    let builder = builder.plugin(tauri_nspanel::init());
+    builder
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_opener::init())
@@ -1388,6 +1391,12 @@ fn main() {
             Ok(())
         })
         .on_window_event(|window, event| {
+            #[cfg(target_os = "macos")]
+            if window.label() == "compact" {
+                if let tauri::WindowEvent::Focused(focused) = event {
+                    overlay::diagnose_native_panel(window.app_handle(), if *focused { "focused" } else { "unfocused" });
+                }
+            }
             if window.label() == "main"
                 && matches!(
                     event,
@@ -1474,8 +1483,16 @@ fn main() {
             overlay::compact_focus,
             overlay::compact_open_main
         ])
-        .run(tauri::generate_context!())
-        .expect("Linger 启动失败");
+        .build(tauri::generate_context!())
+        .expect("Linger 启动失败")
+        .run(|app, event| {
+            #[cfg(target_os = "macos")]
+            if matches!(event, tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit) {
+                overlay::restore_native_panel(app);
+            }
+            #[cfg(not(target_os = "macos"))]
+            let _ = (app, event);
+        });
 }
 
 #[cfg(test)]

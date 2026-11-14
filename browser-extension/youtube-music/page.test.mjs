@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { pageAction } from './page.js';
+import { pageAction, playbackConfirmed, searchConfirmed } from './page.js';
 const visibleElement = () => ({ getClientRects: () => [{}], getAttribute: () => null, parentElement: null });
 const deadline = () => ({ __deadline_ms: Date.now() + 5000 });
 function fixture({ rows = [], menuItems = [], queue = [], title = 'Song', barTitle = title } = {}) {
@@ -44,7 +44,7 @@ test('expired commands never invoke a player action', () => {
 });
 test('status detects underlying player and visible bar disagreement', () => {
   fixture({ barTitle: 'Old song' });
-  assert.equal(pageAction('status', deadline()).synchronized, false);
+  assert.equal(pageAction('status', deadline()).title_matches, false);
 });
 test('queue click targets append for the selected ID, not next or another song', () => {
   const clicked = [];
@@ -115,4 +115,89 @@ test('search submits through enter:keypress instead of only updating input', () 
   pageAction('search_start', { ...deadline(), query: '周杰伦 东风破' });
   assert.equal(submitted, '周杰伦 东风破');
   assert.deepEqual(events, ['input', 'change', 'keydown', 'keypress', 'keyup']);
+});
+
+test('search diagnostics distinguish unsubmitted navigation from waiting for results without query text', () => {
+  fixture();
+  const args = { ...deadline(), query: 'private search phrase' };
+  let state = pageAction('search_read', args);
+  assert.equal(state.search_page, true);
+  assert.equal(state.query_matches, false);
+  assert.equal(state.document_focused, false);
+  assert.equal(state.visibility, 'hidden');
+  assert.equal(JSON.stringify(state).includes(args.query), false);
+  globalThis.location.href = `https://music.youtube.com/search?q=${encodeURIComponent(args.query)}`;
+  state = pageAction('search_read', args);
+  assert.equal(state.query_matches, true);
+  assert.equal(state.ready, false);
+  assert.deepEqual(state.candidates, []);
+  globalThis.location.href = 'https://music.youtube.com/';
+  assert.equal(pageAction('search_read', args).search_page, false);
+});
+
+
+test('localized title mismatch does not reject actual target playback', () => {
+  fixture({ title: 'Christmas Song (Live)', barTitle: 'クリスマスソング (Live) - Christmas Song (Live)' });
+  const state = pageAction('status', deadline());
+  assert.equal(state.title_matches, false);
+  assert.equal(playbackConfirmed(state, { ...state, position_seconds: 14 }, 'abcdefghijk'), true);
+  assert.equal(playbackConfirmed(state, { ...state }, 'abcdefghijk'), false);
+  assert.equal(playbackConfirmed(state, { ...state, position_seconds: 14 }, '12345678901'), false);
+  assert.equal(playbackConfirmed({ ...state, player_state: 3 }, { ...state, position_seconds: 14 }, 'abcdefghijk'), false);
+});
+
+function startSearch(query) {
+  globalThis.HTMLInputElement = class { set value(value) { this.text = value; } dispatchEvent() { return true; } };
+  globalThis.KeyboardEvent = class extends Event { constructor(type, init) { super(type, init); } };
+  const input = new HTMLInputElement();
+  const original = document.querySelector;
+  document.querySelector = selector => selector === 'ytmusic-search-box input' ? input : original(selector);
+  const args = { ...deadline(), query, search_token: 'test-search' };
+  pageAction('search_start', args);
+  return args;
+}
+
+test('same song IDs from a new query are accepted only after renderer refresh and stable reads', () => {
+  const old = row('abcdefghijk');
+  old.data = { title: 'Song' };
+  const rows = [old];
+  fixture({ rows });
+  const args = startSearch('song singer');
+  location.href = 'https://music.youtube.com/search?q=song+singer';
+  let state = pageAction('search_read', args);
+  assert.equal(state.ready, true);
+  assert.equal(state.results_fresh, false);
+  assert.equal(searchConfirmed(state, state), false, 'URL change alone cannot validate old rows');
+  old.data = { title: 'Song' }; // Polymer reused the DOM with new result data.
+  state = pageAction('search_read', args);
+  assert.equal(state.results_fresh, true);
+  assert.equal(searchConfirmed(state, undefined), false, 'one observation does not prove stable results');
+  const next = pageAction('search_read', args);
+  assert.equal(searchConfirmed(next, state), true);
+  assert.equal(next.candidates[0].video_id, 'abcdefghijk');
+});
+
+test('new DOM results with identical content prove freshness but wrong command and hidden rows do not', () => {
+  const rows = [row('abcdefghijk')];
+  fixture({ rows });
+  const args = startSearch('new query');
+  location.href = 'https://music.youtube.com/search?q=new+query';
+  const hidden = row('abcdefghijk'); hidden.getClientRects = () => [];
+  rows.splice(0, 1, hidden);
+  assert.equal(pageAction('search_read', args).ready, false);
+  rows.splice(0, 1, row('abcdefghijk'));
+  const current = pageAction('search_read', args);
+  assert.equal(current.results_fresh, true);
+  assert.equal(searchConfirmed(pageAction('search_read', args), current), true);
+  assert.equal(pageAction('search_read', { ...args, search_token: 'stale-command' }).results_fresh, false);
+});
+
+
+test('retrying a failed query cannot certify its still-stale rows as cached results', () => {
+  fixture({ rows: [row('abcdefghijk')] });
+  let args = startSearch('new query');
+  location.href = 'https://music.youtube.com/search?q=new+query';
+  assert.equal(pageAction('search_read', args).results_fresh, false);
+  args = startSearch('new query');
+  assert.equal(pageAction('search_read', args).results_fresh, false);
 });

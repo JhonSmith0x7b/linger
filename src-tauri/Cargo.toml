@@ -1,6 +1,6 @@
 [package]
 name = "linger"
-version = "0.1.28"
+version = "0.1.29"
 description = "A quiet desktop AI companion"
 edition = "2021"
 
@@ -30,3 +30,6 @@ base64 = "0.22"
 getrandom = "0.2"
 
 tiktoken-rs = "0.12"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+tauri-nspanel = "=2.1.1"
