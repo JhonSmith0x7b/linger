@@ -1,4 +1,5 @@
 import { pageAction, playbackConfirmed, searchConfirmed } from './page.js';
+import { catalogSearch } from './catalog.js';
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 let busy = false;
 let loopRunning = false;
@@ -34,19 +35,28 @@ async function page(tabId, action, args = {}, deadline = Date.now() + 25000) {
   const tab = await chrome.tabs.get(tabId).catch(() => null);
   if (!tab || !tab.url?.startsWith('https://music.youtube.com/')) throw Error('绑定的音乐标签页已关闭或离开 YouTube Music，请重新绑定');
   const result = await Promise.race([
-    chrome.scripting.executeScript({ target: { tabId }, world: 'MAIN', func: pageAction, args: [action, { ...args, __deadline_ms: deadline }] }),
+    chrome.scripting.executeScript({ target: { tabId }, world: 'MAIN', injectImmediately: action === 'status', func: pageAction, args: [action, { ...args, __deadline_ms: deadline }] }),
     sleep(Math.max(1, Math.min(8000, deadline - Date.now()))).then(() => { throw Error('音乐页面响应超时，结果未知；请先查询状态'); }),
   ]);
   if (result[0]?.error) throw Error(result[0].error.message || '页面操作失败');
   if (!result[0]?.result) throw Error('音乐页面未返回结果，请检查页面是否已加载');
   return result[0].result;
 }
-async function until(tabId, action, args, accept, seconds = 18, commandDeadline = Date.now() + 25000) {
+async function until(tabId, action, args, accept, seconds = 18, commandDeadline = Date.now() + 25000, navigating = false) {
   const deadline = Math.min(commandDeadline, Date.now() + seconds * 1000);
   let previous = null;
   while (Date.now() < deadline) {
     await sleep(500);
-    const current = await page(tabId, action, args, commandDeadline);
+    let current;
+    try {
+      current = await page(tabId, action, args, commandDeadline);
+    } catch (error) {
+      // A committed navigation can replace the frame during a read. Only retry
+      // readback; the watch navigation must not be issued a second time.
+      if (!navigating || !/frame|document.*unloaded|音乐页面未返回结果|音乐页面响应超时/i.test(errorText(error))) throw error;
+      previous = null;
+      continue;
+    }
     if (accept(current, previous)) return current;
     previous = current;
   }
@@ -64,36 +74,79 @@ async function execute(config, action, args = {}) {
   const deadline = config.deadline || Date.now() + 25000;
   const invoke = (operation, data = {}) => page(config.tabId, operation, data, deadline);
   const verify = (operation, data, accept, seconds = 18) => until(config.tabId, operation, data, accept, seconds, deadline);
+  async function pageSearch(query) {
+    const search_token = crypto.randomUUID();
+    await invoke('search_start', { query, search_token });
+    return (await verify('search_read', { query, search_token }, searchConfirmed, 18)).candidates;
+  }
   if (action === 'status') return invoke('status');
   if (action === 'search') {
     const query = String(args.query || '').trim();
     if (!query || Array.from(query).length > 200) throw Error('搜索词不能为空且最多 200 字');
     await chrome.storage.local.remove('candidates');
-    const search_token = crypto.randomUUID();
-    await invoke('search_start', { query, search_token });
-    const result = await verify('search_read', { query, search_token }, searchConfirmed, 18);
-    await chrome.storage.local.set({ candidates: result.candidates, candidateTab: config.tabId, candidateQuery: query });
-    return { query, candidates: result.candidates };
+    const context = await invoke('search_context');
+    let candidates;
+    let source = 'page';
+    let catalogError;
+    if (context.visibility === 'hidden') {
+      try {
+        const [frame] = await Promise.race([
+          chrome.scripting.executeScript({ target: { tabId: config.tabId }, world: 'MAIN',
+            injectImmediately: true, func: catalogSearch, args: [query, deadline] }),
+          sleep(Math.max(1, Math.min(7500, deadline - Date.now()))).then(() => { throw Error('目录搜索页面响应超时'); }),
+        ]);
+        if (!frame?.result?.candidates?.length) throw Error(frame?.result?.error || '目录搜索没有返回候选');
+        candidates = frame.result.candidates;
+        source = 'catalog';
+      } catch (error) {
+        catalogError = errorText(error);
+        await note('后台目录搜索失败，改用网页搜索', { error: catalogError });
+      }
+    }
+    if (!candidates) {
+      try {
+        candidates = await pageSearch(query);
+      } catch (error) {
+        throw Error(`source=page visibility=${context.visibility}${catalogError ? ` catalog_error=${catalogError}` : ''}；${errorText(error)}`);
+      }
+    }
+    await chrome.storage.local.set({ candidates, candidateTab: config.tabId, candidateQuery: query, candidateSource: source });
+    return { query, candidates, source, ...(catalogError ? { catalog_error: catalogError } : {}) };
   }
-  const before = await invoke('status');
   if (action === 'play' || action === 'queue') {
     const id = args.video_id;
     if (!/^[A-Za-z0-9_-]{11}$/.test(id || '')) throw Error('需要搜索结果中的歌曲 ID');
-    const stored = await chrome.storage.local.get(['candidates', 'candidateTab', 'candidateQuery']);
+    const stored = await chrome.storage.local.get(['candidates', 'candidateTab', 'candidateQuery', 'candidateSource']);
     if (stored.candidateTab !== config.tabId || !stored.candidates?.some(item => item.video_id === id)) throw Error('请先搜索，再使用搜索结果中的歌曲 ID');
     const selected = { ...args, search_query: stored.candidateQuery };
     if (action === 'queue') {
+      if (stored.candidateSource === 'catalog') {
+        const rows = await pageSearch(stored.candidateQuery);
+        if (!rows.some(item => item.video_id === id)) throw Error('网页结果中未找到所选 ID，未更改队列');
+      }
       const opened = await invoke('queue_open', selected);
       await sleep(350);
       await invoke('queue_click', selected);
       const result = await verify('queue_read', args, state => state.count > opened.before_count, 8);
       return { queued: true, video_id: id, playing: result };
     }
-    await invoke('play', selected);
-    const result = await verify('status', {}, (state, previous) =>
-      playbackConfirmed(state, previous, id));
-    return { ...result, playback_confirmed: true };
+    let source = 'page';
+    if (stored.candidateSource === 'catalog') {
+      const navigation = await invoke('play_catalog', selected);
+      source = navigation.issued ? 'site_router' : 'watch_url';
+      if (!navigation.issued) {
+        const tab = await chrome.tabs.get(config.tabId);
+        if (Date.now() >= deadline || !tab.url?.startsWith('https://music.youtube.com/')) throw Error('音乐命令已过期或绑定页面已离开');
+        await chrome.tabs.update(config.tabId, { url: `https://music.youtube.com/watch?v=${id}` });
+      }
+    } else {
+      await invoke('play', selected);
+    }
+    const result = await until(config.tabId, 'status', {}, (state, previous) =>
+      playbackConfirmed(state, previous, id), 18, deadline, stored.candidateSource === 'catalog');
+    return { ...result, playback_confirmed: true, source };
   }
+  const before = await invoke('status');
   await invoke(action);
   const result = await verify('status', {}, (state, previous) => {
     if (action === 'pause') return state.paused === true && state.player_state === 2;
@@ -164,7 +217,7 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
       const tab = await chrome.tabs.get(tabId);
       if (!tab.url?.startsWith('https://music.youtube.com/')) throw Error('请选择 YouTube Music 标签页');
       await chrome.storage.local.set({ settings: { token, port, tabId, enabled: !!enabled } });
-      await chrome.storage.local.remove(['candidates', 'candidateTab', 'candidateQuery']);
+      await chrome.storage.local.remove(['candidates', 'candidateTab', 'candidateQuery', 'candidateSource']);
       void poll();
       return { saved: true };
     }

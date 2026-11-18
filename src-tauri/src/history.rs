@@ -1,10 +1,13 @@
 //! Local interaction archive. Images are bounded files, never automatic prompt content.
+#[path = "history_index.rs"]
+mod history_index;
+
 use base64::{engine::general_purpose::STANDARD, Engine};
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 use std::{
-    collections::hash_map::DefaultHasher,
+    collections::{hash_map::DefaultHasher, BTreeSet},
     fs,
     hash::{Hash, Hasher},
     io::{Cursor, Write},
@@ -33,12 +36,84 @@ fn now() -> String {
     Utc::now().to_rfc3339()
 }
 
+const COMMON_HAN: &str = "你我他她它的地得这那了着过吗呢呀啊吧嘛哦嗯么些个们在是一有和与也都就又还很会能把被给让要可怎什为来去想说只多少第再现时哪到好请先下上中当如对以所但并没啥";
+
+// Drop low-information conversational terms only for automatic recall; explicit
+// searches still allow users to search for literal words.
+fn recall_terms(query: &str) -> Vec<String> {
+    const COMMON_WORDS: &str = "the you your our what about that this with have was can would could should how for are has and any it to me is my we do did on of in at be";
+    let mut terms = history_index::terms(&short(query, 160));
+    terms.retain(|word| {
+        !word.chars().all(|c| COMMON_HAN.contains(c))
+            && !(word.is_ascii()
+                && (word.len() < 2 || COMMON_WORDS.split_whitespace().any(|stop| stop == word)))
+    });
+    terms.sort_unstable();
+    terms.dedup();
+    terms
+}
+
+struct RecallTurn {
+    id: i64,
+    created: String,
+    user: String,
+    assistant: String,
+}
+
+impl RecallTurn {
+    fn load(conn: &Connection, id: i64, floor: i64, through: i64) -> Result<Option<Self>> {
+        conn.query_row(
+            "SELECT i.id,i.created_at,
+                    coalesce(max(CASE WHEN m.role='user' THEN m.content END),''),
+                    coalesce(max(CASE WHEN m.role='assistant' THEN m.content END),'')
+             FROM interactions i JOIN history_messages m ON m.interaction_id=i.id
+             WHERE i.id=?1 AND i.trigger='chat' AND m.role IN ('user','assistant')
+               AND m.message_id>?2 AND m.message_id<=?3 GROUP BY i.id",
+            params![id, floor, through],
+            |r| {
+                Ok(Self {
+                    id: r.get(0)?,
+                    created: r.get(1)?,
+                    user: r.get(2)?,
+                    assistant: r.get(3)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(error)
+    }
+
+    fn excerpt(&self, chars: usize, terms: &[String]) -> Value {
+        let snippet = |text: &str| {
+            // A match deep inside a long message must survive the prompt budget.
+            let folded = text.to_lowercase();
+            let anchor = terms
+                .iter()
+                .filter_map(|term| {
+                    folded
+                        .find(term)
+                        .map(|offset| (term.chars().count(), std::cmp::Reverse(offset)))
+                })
+                .max()
+                .map_or(0, |(_, offset)| folded[..offset.0].chars().count());
+            let start = if anchor >= chars {
+                anchor.saturating_sub(chars / 3)
+            } else {
+                0
+            };
+            text.chars().skip(start).take(chars).collect::<String>()
+        };
+        json!({"interaction_id": self.id, "created_at": self.created,
+            "user": snippet(&self.user), "assistant": snippet(&self.assistant)})
+    }
+}
+
 impl History {
     pub fn open(dir: &Path) -> Result<Self> {
         fs::create_dir_all(dir).map_err(error)?;
         let images = dir.join("screenshots");
         fs::create_dir_all(&images).map_err(error)?;
-        let connection = Connection::open(dir.join("history.sqlite3")).map_err(error)?;
+        let mut connection = Connection::open(dir.join("history.sqlite3")).map_err(error)?;
         connection
             .busy_timeout(Duration::from_secs(5))
             .map_err(error)?;
@@ -77,6 +152,7 @@ impl History {
             CREATE INDEX IF NOT EXISTS screenshot_blob ON screenshots(blob_id);
             CREATE INDEX IF NOT EXISTS history_tool_interaction ON history_tools(interaction_id);
             CREATE INDEX IF NOT EXISTS image_fingerprint ON image_blobs(fingerprint,available);") .map_err(error)?;
+        history_index::initialize(&mut connection).map_err(error)?;
         let archive = Self {
             connection: Mutex::new(connection),
             images,
@@ -394,6 +470,108 @@ impl History {
         }
         Ok(json!(records))
     }
+    /// Retrieve original chat exchanges that have already left the live context.
+    /// Both boundaries are message IDs; a reset raises the lower bound permanently.
+    pub fn recall(&self, query: &str, floor: i64, through: i64) -> Result<Vec<Value>> {
+        let terms = recall_terms(query);
+        if through <= floor || terms.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.lock()?;
+        history_index::sync_pending(&conn).map_err(error)?;
+        // Prefer whole words and discriminating Han pairs. Common characters
+        // scattered across unrelated text are weak evidence (especially on a
+        // long query); use them only if the query has no substantial word/pair.
+        let specific: Vec<_> = terms
+            .iter()
+            .filter(|term| {
+                term.chars().count() > 1 && !term.chars().any(|c| COMMON_HAN.contains(c))
+            })
+            .cloned()
+            .collect();
+        let expression = history_index::match_any(if specific.is_empty() {
+            &terms
+        } else {
+            &specific
+        });
+        // CROSS JOIN keeps FTS as the outer loop. Otherwise SQLite may probe the
+        // inverted index once for every eligible message in the archive.
+        // Bound the ranked shortlist, not the archive. Both reset and compaction
+        // boundaries also apply to the subsequent original-text and follow-up reads.
+        let mut stmt = conn
+            .prepare(
+                "SELECT d.interaction_id,m.role,search_fts.rank,d.tokens
+             FROM search_fts CROSS JOIN search_documents d ON d.id=search_fts.rowid
+             CROSS JOIN history_messages m ON d.source='message' AND m.message_id=d.source_id
+             CROSS JOIN interactions i ON i.id=d.interaction_id
+             WHERE search_fts MATCH ?1 AND m.message_id>?2 AND m.message_id<=?3
+               AND m.role IN ('user','assistant') AND i.trigger='chat'
+             ORDER BY search_fts.rank, m.message_id DESC LIMIT 64",
+            )
+            .map_err(error)?;
+        let mut rows = stmt
+            .query(params![expression, floor, through])
+            .map_err(error)?;
+        let mut scores = std::collections::BTreeMap::new();
+        while let Some(row) = rows.next().map_err(error)? {
+            let indexed: String = row.get(3).map_err(error)?;
+            let words: BTreeSet<_> = indexed.split_whitespace().collect();
+            let hits: Vec<_> = terms
+                .iter()
+                .filter(|t| words.contains(t.as_str()))
+                .collect();
+            let evidence: usize = hits.iter().map(|t| t.chars().count().min(2)).sum();
+            if evidence < 2 && !(terms.len() == 1 && query.trim().chars().count() == 1) {
+                continue;
+            }
+            let id: i64 = row.get(0).map_err(error)?;
+            let role: String = row.get(1).map_err(error)?;
+            let rank: f64 = row.get(2).map_err(error)?;
+            let (score, covered) = scores.entry(id).or_insert((0.0, BTreeSet::new()));
+            *score += -rank * if role == "user" { 1.0 } else { 0.7 };
+            covered.extend(hits);
+        }
+        // Reward distinct matching terms across an exchange, rather than letting
+        // an assistant merely echoing the same word double its importance.
+        let mut ranked: Vec<_> = scores
+            .into_iter()
+            .map(|(id, (score, covered))| (id, score * (covered.len() as f64).sqrt()))
+            .collect();
+        let best = ranked.iter().map(|(_, score)| *score).fold(0.0, f64::max);
+        // Very small BM25 differences often reflect message length. Prefer the
+        // more recent exchange when scores fall within the same relevance band.
+        let band = |score: f64| (score / best * 20.0).round() as i32;
+        ranked.sort_by(|a, b| band(b.1).cmp(&band(a.1)).then(b.0.cmp(&a.0)));
+        let threshold = best * 0.65;
+        let mut result = Vec::new();
+        let mut included = BTreeSet::new();
+        for (id, score) in ranked {
+            if result.len() == 3 {
+                break;
+            }
+            if score < threshold || !included.insert(id) {
+                continue;
+            }
+            let Some(turn) = RecallTurn::load(&conn, id, floor, through)? else {
+                continue;
+            };
+            let mut item = turn.excerpt(150, &terms);
+            // A reply such as “already finished” often omits the topic entirely.
+            // Keep the immediate exchange where a user could have corrected the answer.
+            if let Some(next) = RecallTurn::load(&conn, id + 1, floor, through)? {
+                let elapsed = DateTime::parse_from_rfc3339(&turn.created)
+                    .ok()
+                    .zip(DateTime::parse_from_rfc3339(&next.created).ok())
+                    .map(|(from, to)| (to - from).num_seconds());
+                if elapsed.is_some_and(|s| (0..=300).contains(&s)) && included.insert(next.id) {
+                    item["follow_up"] = next.excerpt(85, &[]);
+                }
+            }
+            result.push(item);
+        }
+        Ok(result)
+    }
+
     pub fn search(
         &self,
         query: &str,
@@ -407,6 +585,63 @@ impl History {
         self.cleanup()?;
         let query = short(query.trim(), 200);
         let conn = self.lock()?;
+        history_index::sync_pending(&conn).map_err(error)?;
+        let terms = history_index::terms(&query);
+        if !terms.is_empty() {
+            // Quote every term. Spaces in the user's query separate keywords;
+            // punctuation and words like OR are data, never FTS operators.
+            let expression = terms
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
+                .collect::<Vec<_>>()
+                .join(" AND ");
+            let mut stmt = conn.prepare(
+                "WITH hits AS (
+                    SELECT d.interaction_id, d.source, d.source_id, search_fts.rank AS score,
+                           row_number() OVER (PARTITION BY d.interaction_id
+                               ORDER BY search_fts.rank, d.id) AS n
+                    FROM search_fts JOIN search_documents d ON d.id=search_fts.rowid
+                    JOIN interactions i ON i.id=d.interaction_id
+                    WHERE search_fts MATCH ?1
+                      AND (?2 IS NULL OR julianday(i.created_at)>=julianday(?2))
+                      AND (?3 IS NULL OR julianday(i.created_at)<=julianday(?3))
+                      AND (?4 IS NULL OR ?4='' OR i.trigger=?4 OR (?4='screenshot'
+                           AND EXISTS(SELECT 1 FROM screenshot_links s WHERE s.interaction_id=i.id)))
+                )
+                SELECT i.id,i.trigger,i.created_at,
+                    CASE h.source WHEN 'message' THEN m.content WHEN 'tool' THEN t.result
+                        WHEN 'summary' THEN i.summary ELSE i.text END,
+                    (SELECT COUNT(*) FROM screenshot_links WHERE interaction_id=i.id)
+                FROM hits h JOIN interactions i ON i.id=h.interaction_id
+                LEFT JOIN history_messages m ON h.source='message' AND m.message_id=h.source_id
+                LEFT JOIN history_tools t ON h.source='tool' AND t.id=h.source_id
+                WHERE h.n=1 ORDER BY h.score,i.id DESC LIMIT 5").map_err(error)?;
+            let rows = stmt.query_map(params![expression,after,before,kind], |row| {
+                let body: String = row.get(3)?;
+                let lower = body.to_lowercase();
+                let offset = lower.find(&query.to_lowercase()).or_else(||
+                    terms.iter().filter_map(|term| lower.find(term)).min()
+                ).map_or(0, |pos| lower[..pos].chars().count().saturating_sub(35));
+                Ok(json!({"interaction_id":row.get::<_,i64>(0)?, "trigger":row.get::<_,String>(1)?,
+                    "created_at":row.get::<_,String>(2)?, "screenshot_count":row.get::<_,i64>(4)?,
+                    "snippet":body.chars().skip(offset).take(140).collect::<String>()}))
+            }).map_err(error)?;
+            let items = rows
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(error)?;
+            // Preserve literal substring searches such as partial English IDs when
+            // token lookup misses. Han queries are already indexed character by character.
+            if !items.is_empty()
+                || query
+                    .chars()
+                    .all(|c| ('\u{3400}'..='\u{9fff}').contains(&c) || c.is_whitespace())
+            {
+                return Ok(json!({"items":items,"limit":5,"historical_only":true}));
+            }
+        }
+        // Empty-query chronological browsing and literal fallback (e.g. "%_").
         let mut stmt=conn.prepare("SELECT i.id,i.trigger,i.created_at,i.summary,i.text FROM interactions i WHERE
             (?1='' OR instr(lower(i.text),lower(?1))>0 OR instr(lower(i.summary),lower(?1))>0 OR EXISTS(SELECT 1 FROM history_messages m WHERE m.interaction_id=i.id AND instr(lower(m.content),lower(?1))>0) OR EXISTS(SELECT 1 FROM history_tools t WHERE t.interaction_id=i.id AND instr(lower(t.result),lower(?1))>0))
             AND (?2 IS NULL OR julianday(i.created_at)>=julianday(?2)) AND (?3 IS NULL OR julianday(i.created_at)<=julianday(?3))
@@ -652,6 +887,85 @@ mod tests {
         format!("data:image/jpeg;base64,{}", STANDARD.encode(bytes))
     }
     #[test]
+    fn recall_returns_compacted_evidence_and_short_followup_within_reset_bounds() {
+        let temp = Temp::new();
+        let h = History::open(&temp.0).unwrap();
+        for (i, (question, answer)) in [
+            ("课程排期已删除", "先前的旧记录"),
+            ("周末课程排期有变化吗", "我记的是周六"),
+            ("你记错啦，已经改到周日了", "那就周日见"),
+            ("下周的课程排期", "仍然在活动窗口内"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let turn = h.start_interaction("chat", question).unwrap();
+            h.link_message(turn, 2 * i as i64 + 1, "user", question)
+                .unwrap();
+            h.link_message(turn, 2 * i as i64 + 2, "assistant", answer)
+                .unwrap();
+        }
+        let result = h.recall("课程排期呢", 2, 6).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0]["follow_up"]["user"], "你记错啦，已经改到周日了");
+        let encoded = serde_json::to_string(&result).unwrap();
+        assert!(!encoded.contains("已删除"));
+        assert!(!encoded.contains("活动窗口"));
+        assert!(h.recall("有什么想说的吗", 0, 6).unwrap().is_empty());
+        assert!(h.recall("课程排期", 6, 4).unwrap().is_empty());
+    }
+
+    #[test]
+    fn recall_finds_an_old_exchange_and_returns_the_matching_passage() {
+        let temp = Temp::new();
+        let h = History::open(&temp.0).unwrap();
+        let old = h.start_interaction("chat", "记录").unwrap();
+        let original = format!("{}矿井坐标在四十七号门", "无关背景".repeat(210));
+        h.link_message(old, 1, "user", &original).unwrap();
+        // Seed enough eligible messages to put the target outside the old scan cap.
+        {
+            let mut conn = h.lock().unwrap();
+            let tx = conn.transaction().unwrap();
+            for i in 2..=1203 {
+                tx.execute("INSERT INTO interactions(id,trigger,text,created_at) VALUES(?1,'chat','日常',?2)",
+                    params![i,now()]).unwrap();
+                tx.execute(
+                    "INSERT INTO history_messages VALUES(?1,?1,'user','继续日常聊天')",
+                    [i],
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        let results = h.recall("坐标 矿井", 0, 1203).unwrap();
+        assert_eq!(results[0]["interaction_id"], old);
+        assert!(results[0]["user"].as_str().unwrap().contains("矿井坐标"));
+        assert!(h.recall("坐标 矿井", 1, 1203).unwrap().is_empty());
+    }
+
+    #[test]
+    fn recall_rejects_scattered_characters_but_accepts_a_specific_single_character() {
+        let temp = Temp::new();
+        let h = History::open(&temp.0).unwrap();
+        let chat = h.start_interaction("chat", "一抹暮色，远处有森林").unwrap();
+        h.link_message(chat, 1, "user", "一抹暮色，远处有森林")
+            .unwrap();
+        assert!(h.recall("玻色凝聚态的约瑟夫森结", 0, 1).unwrap().is_empty());
+        assert_eq!(h.recall("暮", 0, 1).unwrap()[0]["interaction_id"], chat);
+    }
+
+    #[test]
+    fn recall_preserves_english_word_boundaries_and_completed_actions() {
+        let temp = Temp::new();
+        let h = History::open(&temp.0).unwrap();
+        let chat = h.start_interaction("chat", "Painting").unwrap();
+        h.link_message(chat, 1, "user", "I finished the paint job today.")
+            .unwrap();
+        assert_eq!(h.recall("Paint?", 0, 1).unwrap()[0]["interaction_id"], chat);
+        assert!(h.recall("pain?", 0, 1).unwrap().is_empty());
+    }
+
+    #[test]
     fn deduplicates_pixels_but_keeps_capture_identity_and_discussion_pointer() {
         let temp = Temp::new();
         let h = History::open(&temp.0).unwrap();
@@ -780,6 +1094,32 @@ mod tests {
                 .is_empty()
         );
     }
+    #[test]
+    fn search_keywords_find_matching_source_and_group_by_interaction() {
+        let temp = Temp::new();
+        let h = History::open(&temp.0).unwrap();
+        let first = h.start_interaction("chat", "周末").unwrap();
+        h.update_summary(first, "确认约定").unwrap();
+        h.link_message(first, 1, "assistant", "周末见面，地点定在东侧书亭")
+            .unwrap();
+        h.record_tool(first, "example", &json!({"地点":"东侧书亭","预订":"周末"}))
+            .unwrap();
+        let other = h.start_interaction("observation", "周末只去公园").unwrap();
+        h.link_message(other, 2, "proactive", "下雨了").unwrap();
+
+        let hits = h.search("书亭 周末", None, None, Some("chat")).unwrap();
+        let items = hits["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["interaction_id"], first);
+        assert!(items[0]["snippet"].as_str().unwrap().contains("书亭"));
+        assert!(h
+            .search("周末 书亭", None, None, Some("observation"))
+            .unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+    }
+
     #[test]
     fn imported_roles_matching_snippets_and_versioned_memory_sources() {
         let temp = Temp::new();

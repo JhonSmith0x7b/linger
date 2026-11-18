@@ -201,3 +201,43 @@ test('retrying a failed query cannot certify its still-stale rows as cached resu
   args = startSearch('new query');
   assert.equal(pageAction('search_read', args).results_fresh, false);
 });
+
+test('background catalogue reads the public result data without cookies or rendered rows', async t => {
+  const { catalogSearch } = await import('./catalog.js');
+  fixture();
+  t.mock.method(globalThis, 'fetch', async (_url, options) => {
+    assert.equal(options.credentials, 'omit');
+    assert.equal(JSON.parse(options.body).query, 'two songs');
+    return { ok: true, json: async () => data };
+  });
+  const savedWindow = globalThis.window;
+  globalThis.window = {};
+  t.after(() => { globalThis.window = savedWindow; });
+  const row = (videoId, title) => ({ musicResponsiveListItemRenderer: {
+    playlistItemData: { videoId }, flexColumns: [title, 'Artist • 4:01'].map(text => ({
+      musicResponsiveListItemFlexColumnRenderer: { text: { runs: [{ text }] } },
+    })),
+  } });
+  const rows = [row('invalid', 'Album'), row('abcdefghijk', 'First'), row('abcdefghijk', 'Repeat'),
+    ...Array.from({ length: 10 }, (_, i) => row(String(i).padStart(11, '0'), 'More'))];
+  const data = { contents: { tabbedSearchResultsRenderer: { tabs: [{ tabRenderer: { selected: true,
+    content: { sectionListRenderer: { contents: [{ musicShelfRenderer: { contents: rows } }] } },
+  } }] } } };
+  const { candidates: items } = await catalogSearch('two songs', Date.now() + 5000);
+  assert.equal(items.length, 8);
+  assert.deepEqual(items[0], { video_id: 'abcdefghijk', title: 'First', detail: 'Artist • 4:01', duration: '4:01' });
+  assert.match((await catalogSearch('two songs', 1)).error, /过期/);
+});
+
+test('hidden catalogue playback hands exactly one watch endpoint to the site router', () => {
+  fixture();
+  const calls = [];
+  document.querySelector = selector => selector === 'ytmusic-app' ? {
+    controllerProxy: { handleNavigationEndpoint: value => calls.push(value) },
+  } : null;
+  const args = { ...deadline(), video_id: 'abcdefghijk' };
+  assert.deepEqual(pageAction('play_catalog', args), { issued: true });
+  assert.deepEqual(calls, [{ watchEndpoint: { videoId: 'abcdefghijk' } }]);
+  document.querySelector = () => null;
+  assert.deepEqual(pageAction('play_catalog', args), { issued: false });
+});

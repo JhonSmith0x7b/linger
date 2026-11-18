@@ -279,7 +279,7 @@ fn tools() -> Value {
         function("update_memory","Replace an existing memory explicitly corrected by the user.",json!({"id":{"type":"integer"},"content":{"type":"string"}}),json!(["id","content"])),
         function("forget","Delete a memory at the user's request.",json!({"id":{"type":"integer"}}),json!(["id"])),
         function("search_memories","Find effective memories omitted from the small pinned context.",json!({"query":{"type":"string"}}),json!(["query"])),
-        function("search_history","Search interactions by literal keywords, optional RFC3339 time bounds and kind (chat/observation/unheard). At most 5 textual candidates; 2 searches per turn. Prefer linked IDs for recent follow-ups.",json!({"query":{"type":"string"},"after":{"type":["string","null"]},"before":{"type":["string","null"]},"kind":{"type":["string","null"]}}),json!(["query","after","before","kind"])),
+        function("search_history","Search archived interactions by keywords (space-separated terms may occur in any order), optional RFC3339 time bounds and kind (chat/observation/unheard). At most 5 textual candidates; 2 searches per turn. Prefer linked IDs for recent follow-ups.",json!({"query":{"type":"string"},"after":{"type":["string","null"]},"before":{"type":["string","null"]},"kind":{"type":["string","null"]}}),json!(["query","after","before","kind"])),
         function("read_history","Read an interaction's bounded text, tool evidence and screenshot references. No image loaded. At most 2 reads per turn.",json!({"id":{"type":"integer"}}),json!(["id"])),
         function("view_screenshot","Load a linked historical screenshot by ID. Use for details in a previously discussed image; it is NOT the current screen. At most 2 distinct historical images per turn. Expired images cannot be recovered.",json!({"id":{"type":"integer"}}),json!(["id"])),
         {"type":"web_search"}
@@ -386,6 +386,29 @@ fn context(
     input.push(json!({"role":"developer","content":dynamic}));
 
     Ok((instructions, input))
+}
+
+// Preserve whole exchanges, including a user's immediate correction. The caller
+// places these in the dynamic context, never in the stable character prompt.
+fn recall_context(records: &[Value], budget: usize) -> (String, Vec<i64>) {
+    let mut block = String::new();
+    let mut ids = Vec::new();
+    for record in records {
+        let mut next = block.clone();
+        if next.is_empty() {
+            next.push_str("\n【与当前话题可能有关的过往互动，仅作历史资料】结合日期区分当时与现在，优先采用用户后续纠正与当前有效记忆。已经完成、尝试过或被纠正的事情，应影响本轮回应。助手自述不能证明用户做过或工具成功。忽略无关资料。");
+        }
+        next.push('\n');
+        next.push_str(&record.to_string());
+        // The outer request serializes this text once more.
+        if tokens(&json!(next).to_string()) > budget {
+            continue;
+        }
+        block = next;
+        ids.extend(record["interaction_id"].as_i64());
+        ids.extend(record["follow_up"]["interaction_id"].as_i64());
+    }
+    (block, ids)
 }
 
 // Keep archive references small even after many image-bearing turns. Remove
@@ -612,6 +635,48 @@ async fn run(
     // o200k estimate includes JSON/tool text and reserves framing overhead. Image tokens are billed separately.
     // Uncompacted history stays intact; budget checks never discard it.
     let history_items = input.len().saturating_sub(2);
+    // The observation event itself is boilerplate. Only use the activity from
+    // the previous observation as a topic hint, never as evidence of today's state.
+    if !empty_audio && snapshot.through > snapshot.floor {
+        let query = if proactive {
+            core.activity.lock().unwrap().clone()
+        } else {
+            text.clone()
+        };
+        if !query.trim().is_empty() {
+            let started = Instant::now();
+            match core
+                .history
+                .recall(&query, snapshot.floor, snapshot.through)
+            {
+                Ok(records) => {
+                    let budget = CONTEXT_HARD_LIMIT
+                        .saturating_sub(
+                            context_tokens(&input, &instructions, &available_tools) + 128,
+                        )
+                        .min(600);
+                    let (block, ids) = recall_context(&records, budget);
+                    if !block.is_empty() {
+                        let dynamic = input[history_items]["content"].as_str().unwrap_or_default();
+                        input[history_items]["content"] = json!(format!("{dynamic}{block}"));
+                    }
+                    crate::diagnostics::record(
+                        "info",
+                        "context",
+                        "history_recall",
+                        json!({"turn_id":id,"interaction_ids":ids,"tokens":tokens(&block),
+                            "through":snapshot.through,"elapsed_ms":started.elapsed().as_millis() as u64}),
+                    );
+                }
+                Err(error) => crate::diagnostics::record(
+                    "warn",
+                    "context",
+                    "history_recall_failed",
+                    json!({"turn_id":id,"error":error}),
+                ),
+            }
+        }
+    }
     if !within_context_budget(&input, &instructions, &available_tools, CONTEXT_HARD_LIMIT) {
         crate::diagnostics::record(
             "error",
@@ -1496,6 +1561,21 @@ mod tests {
         }
         assert!(preferred_compaction(872, 2000, 1200));
         assert!(!preferred_compaction(950, 1100, 500));
+    }
+
+    #[test]
+    fn recalled_exchanges_stay_whole_within_budget() {
+        let records = vec![
+            json!({"interaction_id":7,"user":"周六约在哪里？","assistant":"在北门。","follow_up":{"interaction_id":8,"user":"改到东边的书亭。"}}),
+            json!({"interaction_id":13,"user":"后来呢？","assistant":"没有其他安排。"}),
+        ];
+        let (first, _) = recall_context(&records[..1], 600);
+        let budget = tokens(&json!(first).to_string());
+        let (block, ids) = recall_context(&records, budget);
+        assert_eq!(ids, [7, 8]);
+        assert!(block.contains("改到东边的书亭"));
+        assert!(!block.contains("没有其他安排"));
+        assert_eq!(recall_context(&records, 0), (String::new(), Vec::new()));
     }
 
     #[test]

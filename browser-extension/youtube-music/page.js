@@ -40,6 +40,18 @@ export function pageAction(action, args) {
     };
   };
   if (action === 'status') return status();
+  if (action === 'play_catalog') {
+    if (!/^[A-Za-z0-9_-]{11}$/.test(args.video_id || '')) throw Error('无效的歌曲 ID');
+    const app = document.querySelector('ytmusic-app');
+    const router = [app?.controllerProxy, app?.polymerController, app]
+      .find(candidate => typeof candidate?.handleNavigationEndpoint === 'function');
+    if (!router) return { issued: false };
+    router.handleNavigationEndpoint({ watchEndpoint: { videoId: args.video_id } });
+    return { issued: true };
+  }
+  if (action === 'search_context') {
+    return { visibility: document.visibilityState };
+  }
   if (action === 'search_start') {
     const previousQuery = new URL(location.href).searchParams.get('q');
     // Keep one bounded snapshot across MAIN-world invocations. Song IDs alone

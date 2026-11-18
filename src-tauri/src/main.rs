@@ -248,6 +248,10 @@ fn open_music_extension_folder(app: tauri::AppHandle) -> Result<(), String> {
             include_str!("../../browser-extension/youtube-music/worker.js"),
         ),
         (
+            "catalog.js",
+            include_str!("../../browser-extension/youtube-music/catalog.js"),
+        ),
+        (
             "page.js",
             include_str!("../../browser-extension/youtube-music/page.js"),
         ),
